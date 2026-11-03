@@ -18,9 +18,23 @@ class LiveRemoteHandler(AbletonOSCHandler):
     def init_api(self):
         self.osc_server.add_handler("/live/song/get/track_snapshot", lambda params: self._snapshot())
         self.osc_server.add_handler("/live/song/start_listen/clip_grid", self._start_listen_clip_grid)
+        self.osc_server.add_handler("/live/song/set/arm_exclusive", self._set_arm_exclusive)
         self.osc_server.add_handler("/live/song/start_listen/device_page", self._start_listen_device_page)
         self.osc_server.add_handler("/live/song/start_listen/tracks", self._start_listen_tracks)
         self.osc_server.add_handler("/live/song/stop_listen/tracks", self._stop_listen_tracks)
+
+    def _set_arm_exclusive(self, params):
+        """
+        /live/song/set/arm_exclusive <track_index>
+
+        Arms the track and disarms every other track, as selecting a track does on Push.
+        Tracks that cannot be armed (group tracks) are left alone. The arm listeners
+        report the result.
+        """
+        index = int(params[0])
+        for i, track in enumerate(self.song.tracks):
+            if track.can_be_armed:
+                track.arm = (i == index)
 
     def _snapshot(self):
         """
