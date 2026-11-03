@@ -71,7 +71,9 @@ class AbletonOSCHandler(Component):
 
         listener_key = (prop, tuple(params))
         if listener_key in self.listener_functions:
-            self._stop_listen(target, prop, params)
+            # Remove from the object that was registered, not from whatever is at this
+            # index now: tracks shift when the user deletes or moves them.
+            self._stop_listen(self.listener_objects[listener_key], prop, params)
 
         self.logger.info("Adding listener for %s %s, property: %s" % (self.class_identifier, str(params), prop))
         add_listener_function_name = "add_%s_listener" % prop
