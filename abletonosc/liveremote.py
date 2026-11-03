@@ -12,8 +12,31 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.class_identifier = "song"
 
     def init_api(self):
+        self.osc_server.add_handler("/live/song/get/track_snapshot", lambda params: self._snapshot())
         self.osc_server.add_handler("/live/song/start_listen/tracks", self._start_listen_tracks)
         self.osc_server.add_handler("/live/song/stop_listen/tracks", self._stop_listen_tracks)
+
+    def _snapshot(self):
+        """
+        /live/song/get/track_snapshot
+
+        One flat reply with 8 values per track, in track order: name, color, volume, mute,
+        solo, arm, playing_slot_index, fired_slot_index. Lets a client redraw the whole
+        mixer at once instead of waiting for one listener reply per property.
+        """
+        values = []
+        for track in self.song.tracks:
+            values += [
+                track.name,
+                track.color,
+                float(track.mixer_device.volume.value),
+                bool(track.mute),
+                bool(track.solo),
+                bool(track.arm) if track.can_be_armed else False,
+                int(track.playing_slot_index),
+                int(track.fired_slot_index),
+            ]
+        return tuple(values)
 
     def _start_listen_tracks(self, params):
         """
@@ -37,11 +60,13 @@ class LiveRemoteHandler(AbletonOSCHandler):
                     handler._clear_listeners()
             self.logger.info("Sending track count %d" % len(self.song.tracks))
             self.osc_server.send("/live/song/get/tracks", (len(self.song.tracks),))
+            self.osc_server.send("/live/song/get/track_snapshot", self._snapshot())
 
         self.song.add_tracks_listener(tracks_changed)
         self.listener_functions[key] = tracks_changed
         self.listener_objects[key] = self.song
         self.osc_server.send("/live/song/get/tracks", (len(self.song.tracks),))
+        self.osc_server.send("/live/song/get/track_snapshot", self._snapshot())
 
     def _stop_listen_tracks(self, params):
         self._stop_listen(self.song, "tracks", ())
