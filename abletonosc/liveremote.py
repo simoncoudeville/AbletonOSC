@@ -35,6 +35,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
             for handler in self.manager.handlers:
                 if handler.class_identifier == "track":
                     handler._clear_listeners()
+            self.logger.info("Sending track count %d" % len(self.song.tracks))
             self.osc_server.send("/live/song/get/tracks", (len(self.song.tracks),))
 
         self.song.add_tracks_listener(tracks_changed)

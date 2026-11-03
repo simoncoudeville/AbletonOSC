@@ -184,7 +184,7 @@ class OSCServer:
                 self.logger.error("AbletonOSC: Socket error: %s" % (traceback.format_exc()))
 
         except Exception as e:
-            self.logger.error("AbletonOSC: Error handling OSC message: %s" % e)
+            self.logger.error("AbletonOSC: Error handling OSC message %s %s: %s" % (message.address, message.params, e))
             self.logger.warning("AbletonOSC: %s" % traceback.format_exc())
 
     def shutdown(self) -> None:

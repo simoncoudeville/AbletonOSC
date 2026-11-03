@@ -73,7 +73,7 @@ class AbletonOSCHandler(Component):
         if listener_key in self.listener_functions:
             # Remove from the object that was registered, not from whatever is at this
             # index now: tracks shift when the user deletes or moves them.
-            self._stop_listen(self.listener_objects[listener_key], prop, params)
+            self._stop_listen(self.listener_objects.get(listener_key, target), prop, params)
 
         self.logger.info("Adding listener for %s %s, property: %s" % (self.class_identifier, str(params), prop))
         add_listener_function_name = "add_%s_listener" % prop
@@ -103,8 +103,8 @@ class AbletonOSCHandler(Component):
                 #--------------------------------------------------------------------------------
                 self.logger.info("Exception whilst removing listener (likely benign): %s" % e)
 
-            del self.listener_functions[listener_key]
-            del self.listener_objects[listener_key]
+            self.listener_functions.pop(listener_key, None)
+            self.listener_objects.pop(listener_key, None)
         else:
             self.logger.warning("No listener function found for property: %s (%s)" % (prop, str(params)))
 
@@ -113,6 +113,9 @@ class AbletonOSCHandler(Component):
         Clears all listener functions, to prevent listeners continuing to report after a reload.
         """
         for listener_key in list(self.listener_functions.keys())[:]:
-            target = self.listener_objects[listener_key]
+            target = self.listener_objects.get(listener_key)
             prop, params = listener_key
+            if target is None:
+                self.listener_functions.pop(listener_key, None)
+                continue
             self._stop_listen(target, prop, params)
