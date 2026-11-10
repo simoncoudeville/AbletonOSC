@@ -69,6 +69,11 @@ class AbletonOSCHandler(Component):
             osc_address = "/live/%s/get/%s" % (self.class_identifier, prop)
             self.osc_server.send(osc_address, (*params, *value,))
 
+        if prop == "arm" and not getattr(target, "can_be_armed", True):
+            # Group tracks have no arm state: report "not armed" instead of raising.
+            self.osc_server.send("/live/%s/get/arm" % self.class_identifier, (*params, False))
+            return
+
         listener_key = (prop, tuple(params))
         if listener_key in self.listener_functions:
             # Remove from the object that was registered, not from whatever is at this

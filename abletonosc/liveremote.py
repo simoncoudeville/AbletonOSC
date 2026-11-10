@@ -14,6 +14,10 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.clip_grid_active = False
         self.device_listeners = []
         self.device_page_active = False
+        self.playback_listeners = []
+        self.playback_pending = False
+        self.mixer_listeners = []
+        self.mixer_pending = False
 
     def init_api(self):
         self.osc_server.add_handler("/live/song/get/track_snapshot", lambda params: self._snapshot())
@@ -36,16 +40,165 @@ class LiveRemoteHandler(AbletonOSCHandler):
             if track.can_be_armed:
                 track.arm = (i == index)
 
+    # Mixer state (pan and sends) ----------------------------------------------------
+
+    def _mixer_values(self):
+        """
+        [send_count, then per track: panning, send 1 ... send N]. Sent as one message for
+        all tracks, like the playback state, so the mixer redraws at once.
+        """
+        send_count = len(self.song.return_tracks)
+        values = [send_count]
+        for track in self.song.tracks:
+            values.append(float(track.mixer_device.panning.value))
+            sends = track.mixer_device.sends
+            for i in range(send_count):
+                values.append(float(sends[i].value) if i < len(sends) else 0.0)
+        return tuple(values)
+
+    def _queue_mixer(self):
+        if self.mixer_pending:
+            return
+        self.mixer_pending = True
+
+        def flush():
+            self.mixer_pending = False
+            self.osc_server.send("/live/song/get/track_mixer", self._mixer_values())
+
+        self.manager.schedule_message(1, flush)
+
+    def _rebuild_mixer_listeners(self):
+        self._remove_mixer_listeners()
+        parameters = []
+        for track in self.song.tracks:
+            parameters.append(track.mixer_device.panning)
+            parameters.extend(track.mixer_device.sends)
+        for parameter in parameters:
+            parameter.add_value_listener(self._queue_mixer)
+            self.mixer_listeners.append(parameter)
+
+    def _remove_mixer_listeners(self):
+        for parameter in self.mixer_listeners:
+            try:
+                parameter.remove_value_listener(self._queue_mixer)
+            except Exception as e:
+                self.logger.info("Exception whilst removing mixer listener (likely benign): %s" % e)
+        self.mixer_listeners = []
+
+    # Playback state ----------------------------------------------------------------
+
+    def _playback_values(self):
+        """
+        Per track, in track order: playing_slot_index, fired_slot_index, then for the playing
+        clip its start, end, position (beats) and looping. start is -1 when nothing plays.
+        start/end is the loop range when looping, else the start/end markers. The client
+        animates the position itself from the tempo.
+        """
+        values = []
+        tracks = list(self.song.tracks)
+        for track in tracks:
+            playing = int(track.playing_slot_index)
+            fired = int(track.fired_slot_index)
+            if track.is_foldable:
+                # A group slot plays and queues with the clips inside the group.
+                for other in tracks:
+                    if self._is_in_group(other, track):
+                        if playing < 0 and int(other.playing_slot_index) >= 0:
+                            playing = int(other.playing_slot_index)
+                        if fired < 0 and int(other.fired_slot_index) >= 0:
+                            fired = int(other.fired_slot_index)
+            start, end, position, looping = -1.0, 0.0, 0.0, False
+            if playing >= 0:
+                # A group follows the longest clip playing in its row.
+                candidates = [track] if not track.is_foldable else [
+                    other for other in tracks if self._is_in_group(other, track)]
+                best = -1.0
+                for other in candidates:
+                    if int(other.playing_slot_index) != playing or not other.clip_slots[playing].has_clip:
+                        continue
+                    clip = other.clip_slots[playing].clip
+                    is_looping = bool(clip.looping)
+                    if is_looping:
+                        c_start, c_end = float(clip.loop_start), float(clip.loop_end)
+                    else:
+                        c_start, c_end = float(clip.start_marker), float(clip.end_marker)
+                    if c_end - c_start > best:
+                        best = c_end - c_start
+                        start, end, looping = c_start, c_end, is_looping
+                        position = float(clip.playing_position)
+            values += [playing, fired, start, end, position, looping]
+        return tuple(values)
+
+    @staticmethod
+    def _is_in_group(track, group):
+        """True when `track` sits anywhere inside the group track `group`."""
+        parent = track.group_track
+        while parent is not None:
+            if parent == group:
+                return True
+            parent = parent.group_track
+        return False
+
+    @staticmethod
+    def _slot_launchable(track, slot):
+        """A slot with a clip, or a group slot that launches the clips inside the group."""
+        if slot.has_clip:
+            return True
+        try:
+            return bool(track.is_foldable and slot.controls_other_clips)
+        except Exception:
+            return False
+
+    def _queue_playback(self):
+        """
+        Launching a scene changes the playing clip of every track in the same moment. One
+        reply per track would reach the client one OSC tick (100 ms) apart and the grid
+        would update cell by cell. So the listeners only queue, and one message with all
+        tracks goes out on the next tick.
+        """
+        if self.playback_pending:
+            return
+        self.playback_pending = True
+
+        def flush():
+            self.playback_pending = False
+            self.osc_server.send("/live/song/get/track_playback", self._playback_values())
+
+        self.manager.schedule_message(1, flush)
+
+    def _rebuild_playback_listeners(self):
+        self._remove_playback_listeners()
+        for track in self.song.tracks:
+            for name in ("playing_slot_index", "fired_slot_index"):
+                add = getattr(track, "add_%s_listener" % name)
+                add(self._queue_playback)
+                self.playback_listeners.append((track, name))
+
+    def _remove_playback_listeners(self):
+        for track, name in self.playback_listeners:
+            try:
+                getattr(track, "remove_%s_listener" % name)(self._queue_playback)
+            except Exception as e:
+                self.logger.info("Exception whilst removing playback listener (likely benign): %s" % e)
+        self.playback_listeners = []
+
     def _snapshot(self):
         """
         /live/song/get/track_snapshot
 
-        One flat reply with 8 values per track, in track order: name, color, volume, mute,
-        solo, arm, playing_slot_index, fired_slot_index. Lets a client redraw the whole
+        One flat reply with 10 values per track, in track order: name, color, volume, mute,
+        solo, arm, playing_slot_index, fired_slot_index, is_group, group_root (index of the
+        outermost group track this track belongs to, itself when it is one, else -1). Lets a client redraw the whole
         mixer at once instead of waiting for one listener reply per property.
         """
         values = []
-        for track in self.song.tracks:
+        tracks = list(self.song.tracks)
+        for track in tracks:
+            root = track
+            while root.group_track is not None:
+                root = root.group_track
+            group_root = next((i for i, t in enumerate(tracks) if t == root), -1) \
+                if (root is not track or track.is_foldable) else -1
             values += [
                 track.name,
                 track.color,
@@ -55,6 +208,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
                 bool(track.arm) if track.can_be_armed else False,
                 int(track.playing_slot_index),
                 int(track.fired_slot_index),
+                bool(track.is_foldable),
+                group_root,
             ]
         return tuple(values)
 
@@ -81,6 +236,10 @@ class LiveRemoteHandler(AbletonOSCHandler):
             self.logger.info("Sending track count %d" % len(self.song.tracks))
             self.osc_server.send("/live/song/get/tracks", (len(self.song.tracks),))
             self.osc_server.send("/live/song/get/track_snapshot", self._snapshot())
+            self._rebuild_playback_listeners()
+            self.osc_server.send("/live/song/get/track_playback", self._playback_values())
+            self._rebuild_mixer_listeners()
+            self.osc_server.send("/live/song/get/track_mixer", self._mixer_values())
             if self.clip_grid_active:
                 self._rebuild_clip_listeners()
                 self._send_clip_grid()
@@ -90,9 +249,15 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.listener_objects[key] = self.song
         self.osc_server.send("/live/song/get/tracks", (len(self.song.tracks),))
         self.osc_server.send("/live/song/get/track_snapshot", self._snapshot())
+        self._rebuild_playback_listeners()
+        self.osc_server.send("/live/song/get/track_playback", self._playback_values())
+        self._rebuild_mixer_listeners()
+        self.osc_server.send("/live/song/get/track_mixer", self._mixer_values())
 
     def _stop_listen_tracks(self, params):
         self._stop_listen(self.song, "tracks", ())
+        self._remove_playback_listeners()
+        self._remove_mixer_listeners()
 
     # Clip grid ----------------------------------------------------------------------
 
@@ -126,16 +291,19 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self._remove_clip_listeners()
         for track_index, track in enumerate(self.song.tracks):
             for scene_index, slot in enumerate(track.clip_slots):
-                def has_clip_changed(slot=slot, track_index=track_index, scene_index=scene_index):
+                def has_clip_changed(slot=slot, track=track, track_index=track_index, scene_index=scene_index):
                     self.osc_server.send("/live/song/get/clip_slot_has_clip",
-                                         (track_index, scene_index, bool(slot.has_clip)))
+                                         (track_index, scene_index, self._slot_launchable(track, slot)))
                 slot.add_has_clip_listener(has_clip_changed)
-                self.clip_listeners.append((slot, has_clip_changed))
+                self.clip_listeners.append((slot, "has_clip", has_clip_changed))
+                if track.is_foldable:
+                    slot.add_controls_other_clips_listener(has_clip_changed)
+                    self.clip_listeners.append((slot, "controls_other_clips", has_clip_changed))
 
     def _remove_clip_listeners(self):
-        for slot, function in self.clip_listeners:
+        for slot, name, function in self.clip_listeners:
             try:
-                slot.remove_has_clip_listener(function)
+                getattr(slot, "remove_%s_listener" % name)(function)
             except Exception as e:
                 self.logger.info("Exception whilst removing clip listener (likely benign): %s" % e)
         self.clip_listeners = []
@@ -144,7 +312,10 @@ class LiveRemoteHandler(AbletonOSCHandler):
         tracks = list(self.song.tracks)
         values = [len(tracks), len(self.song.scenes)]
         for track in tracks:
-            values += [bool(slot.has_clip) for slot in track.clip_slots]
+            values += [self._slot_launchable(track, slot) for slot in track.clip_slots]
+            if track.is_foldable:
+                self.logger.info("Group track %s: launchable slots %s" % (
+                    track.name, [self._slot_launchable(track, slot) for slot in track.clip_slots]))
         self.osc_server.send("/live/song/get/clip_grid", tuple(values))
 
     # Device page --------------------------------------------------------------------
@@ -254,6 +425,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
 
     def clear_api(self):
         self._remove_clip_listeners()
+        self._remove_playback_listeners()
+        self._remove_mixer_listeners()
         self._remove_device_listeners()
         self.device_page_active = False
         self.clip_grid_active = False

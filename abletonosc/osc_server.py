@@ -87,7 +87,14 @@ class OSCServer:
     def process_message(self, message, remote_addr):
         if message.address in self._callbacks:
             callback = self._callbacks[message.address]
-            rv = callback(message.params)
+            try:
+                rv = callback(message.params)
+            except Exception as e:
+                # One failing handler (e.g. an arm listener on a track that cannot be
+                # armed) must not abort the rest of the queue or the tick.
+                self.logger.error("AbletonOSC: Error handling OSC message %s %s: %s" % (message.address, message.params, e))
+                self.logger.warning("AbletonOSC: %s" % traceback.format_exc())
+                return
 
             if rv is not None:
                 assert isinstance(rv, tuple)
@@ -184,7 +191,7 @@ class OSCServer:
                 self.logger.error("AbletonOSC: Socket error: %s" % (traceback.format_exc()))
 
         except Exception as e:
-            self.logger.error("AbletonOSC: Error handling OSC message %s %s: %s" % (message.address, message.params, e))
+            self.logger.error("AbletonOSC: Error processing OSC data: %s" % e)
             self.logger.warning("AbletonOSC: %s" % traceback.format_exc())
 
     def shutdown(self) -> None:
