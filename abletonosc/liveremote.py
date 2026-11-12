@@ -18,6 +18,13 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.playback_pending = False
         self.mixer_listeners = []
         self.mixer_pending = False
+        self.global_listeners = []
+        self.global_pending = False
+        self.global_active = False
+        self.global_poll_token = 0
+        self.global_undo_state = (None, None)
+        self.position_active = False
+        self.last_position = None
 
     def init_api(self):
         self.osc_server.add_handler("/live/song/get/track_snapshot", lambda params: self._snapshot())
@@ -26,6 +33,11 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.osc_server.add_handler("/live/song/start_listen/device_page", self._start_listen_device_page)
         self.osc_server.add_handler("/live/song/start_listen/tracks", self._start_listen_tracks)
         self.osc_server.add_handler("/live/song/stop_listen/tracks", self._stop_listen_tracks)
+        self.osc_server.add_handler("/live/song/start_listen/global_state", self._start_listen_global_state)
+        self.osc_server.add_handler("/live/song/stop_listen/global_state", self._stop_listen_global_state)
+        self.osc_server.add_handler("/live/song/set/session_automation_record", self._set_session_automation_record)
+        self.osc_server.add_handler("/live/song/start_listen/position", self._start_listen_position)
+        self.osc_server.add_handler("/live/song/stop_listen/position", self._stop_listen_position)
 
     def _set_arm_exclusive(self, params):
         """
@@ -39,6 +51,149 @@ class LiveRemoteHandler(AbletonOSCHandler):
         for i, track in enumerate(self.song.tracks):
             if track.can_be_armed:
                 track.arm = (i == index)
+
+    # Global state (top bar) ---------------------------------------------------------
+
+    GLOBAL_LISTENED = (
+        "is_playing", "tempo", "signature_numerator", "signature_denominator", "metronome",
+        "record_mode", "arrangement_overdub", "session_record", "session_record_status",
+        "session_automation_record", "re_enable_automation_enabled", "can_capture_midi",
+        "clip_trigger_quantization", "root_note", "scale_name", "count_in_duration", "groove_amount",
+    )
+
+    def _global_values(self):
+        """
+        One flat list, in this order: is_playing, tempo, signature_numerator,
+        signature_denominator, metronome, record_mode, arrangement_overdub, session_record,
+        session_record_status, session_automation_record, re_enable_automation_enabled,
+        can_capture_midi, can_undo, can_redo, clip_trigger_quantization, root_note,
+        scale_name, count_in_duration, groove_amount.
+        """
+        song = self.song
+        return (
+            bool(song.is_playing),
+            float(song.tempo),
+            int(song.signature_numerator),
+            int(song.signature_denominator),
+            bool(song.metronome),
+            bool(song.record_mode),
+            bool(song.arrangement_overdub),
+            bool(song.session_record),
+            int(song.session_record_status),
+            bool(song.session_automation_record),
+            bool(song.re_enable_automation_enabled),
+            bool(song.can_capture_midi),
+            bool(song.can_undo),
+            bool(song.can_redo),
+            int(song.clip_trigger_quantization),
+            int(song.root_note),
+            str(song.scale_name),
+            int(song.count_in_duration),
+            float(song.groove_amount),
+        )
+
+    def _queue_global(self):
+        """
+        Several properties often change in the same moment (Play also moves the record
+        state). The listeners only queue, and one message with the whole state goes out on
+        the next tick, so the top bar redraws at once.
+        """
+        if self.global_pending:
+            return
+        self.global_pending = True
+
+        def flush():
+            self.global_pending = False
+            if not self.global_active:
+                return
+            self.global_undo_state = (bool(self.song.can_undo), bool(self.song.can_redo))
+            self.osc_server.send("/live/song/get/global_state", self._global_values())
+
+        self.manager.schedule_message(1, flush)
+
+    def _poll_undo(self, token):
+        """can_undo and can_redo have no listeners in Live: re-read them twice a second."""
+        if token != self.global_poll_token or not self.global_active:
+            return
+        state = (bool(self.song.can_undo), bool(self.song.can_redo))
+        if state != self.global_undo_state:
+            self._queue_global()
+        self.manager.schedule_message(5, lambda: self._poll_undo(token))
+
+    def _start_listen_global_state(self, params):
+        """
+        /live/song/start_listen/global_state
+
+        Replies on /live/song/get/global_state with 19 values (see _global_values), right
+        away and again after any change, coalesced into one message per tick. Powers the
+        top bar: transport, record and automation buttons, tempo, signature, Metronome,
+        Undo and Redo, Global Quantization, scale, count-in and groove amount.
+        """
+        self._remove_global_listeners()
+        for name in self.GLOBAL_LISTENED:
+            try:
+                getattr(self.song, "add_%s_listener" % name)(self._queue_global)
+                self.global_listeners.append(name)
+            except Exception as e:
+                self.logger.info("No listener for %s: %s" % (name, e))
+        self.global_active = True
+        self.global_poll_token += 1
+        token = self.global_poll_token
+        self.global_undo_state = (bool(self.song.can_undo), bool(self.song.can_redo))
+        self.osc_server.send("/live/song/get/global_state", self._global_values())
+        self.manager.schedule_message(5, lambda: self._poll_undo(token))
+
+    def _stop_listen_global_state(self, params):
+        self._remove_global_listeners()
+
+    def _remove_global_listeners(self):
+        self.global_active = False
+        self.global_poll_token += 1
+        for name in self.global_listeners:
+            try:
+                getattr(self.song, "remove_%s_listener" % name)(self._queue_global)
+            except Exception as e:
+                self.logger.info("Exception whilst removing global listener (likely benign): %s" % e)
+        self.global_listeners = []
+
+    def _set_session_automation_record(self, params):
+        """/live/song/set/session_automation_record <0|1>  (Automation Arm)"""
+        self.song.session_automation_record = bool(int(params[0]))
+
+    def _position(self):
+        t = self.song.get_current_beats_song_time()
+        return (int(t.bars), int(t.beats))
+
+    def _start_listen_position(self, params):
+        """
+        /live/song/start_listen/position
+
+        Replies on /live/song/get/position with [bars, beats] right away and then once
+        per new beat, also when the song time is set (for example back to 1, 1). Bars and
+        beats count in the time signature's denominator, as Live's position display does.
+        """
+        self._stop_listen_position()
+
+        def time_changed():
+            position = self._position()
+            if position != self.last_position:
+                self.last_position = position
+                self.osc_server.send("/live/song/get/position", position)
+
+        self.position_function = time_changed
+        self.song.add_current_song_time_listener(time_changed)
+        self.position_active = True
+        self.last_position = self._position()
+        self.osc_server.send("/live/song/get/position", self.last_position)
+
+    def _stop_listen_position(self, params=()):
+        if self.position_active:
+            try:
+                self.song.remove_current_song_time_listener(self.position_function)
+            except Exception as e:
+                self.logger.info("Exception whilst removing position listener (likely benign): %s" % e)
+        self.position_active = False
+        self.last_position = None
 
     # Mixer state (pan and sends) ----------------------------------------------------
 
@@ -424,6 +579,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.osc_server.send("/live/song/get/device_params", tuple(values))
 
     def clear_api(self):
+        self._remove_global_listeners()
+        self._stop_listen_position()
         self._remove_clip_listeners()
         self._remove_playback_listeners()
         self._remove_mixer_listeners()
