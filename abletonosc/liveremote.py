@@ -36,6 +36,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.osc_server.add_handler("/live/song/start_listen/global_state", self._start_listen_global_state)
         self.osc_server.add_handler("/live/song/stop_listen/global_state", self._stop_listen_global_state)
         self.osc_server.add_handler("/live/song/set/session_automation_record", self._set_session_automation_record)
+        self.osc_server.add_handler("/live/song/set/scale_mode", self._set_scale_mode)
         self.osc_server.add_handler("/live/song/start_listen/position", self._start_listen_position)
         self.osc_server.add_handler("/live/song/stop_listen/position", self._stop_listen_position)
 
@@ -58,7 +59,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
         "is_playing", "tempo", "signature_numerator", "signature_denominator", "metronome",
         "record_mode", "arrangement_overdub", "session_record", "session_record_status",
         "session_automation_record", "re_enable_automation_enabled", "can_capture_midi",
-        "clip_trigger_quantization", "root_note", "scale_name", "count_in_duration", "groove_amount",
+        "clip_trigger_quantization", "root_note", "scale_name", "scale_mode", "count_in_duration",
+        "groove_amount",
     )
 
     def _global_values(self):
@@ -67,7 +69,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
         signature_denominator, metronome, record_mode, arrangement_overdub, session_record,
         session_record_status, session_automation_record, re_enable_automation_enabled,
         can_capture_midi, can_undo, can_redo, clip_trigger_quantization, root_note,
-        scale_name, count_in_duration, groove_amount.
+        scale_name, scale_mode, count_in_duration, groove_amount.
         """
         song = self.song
         return (
@@ -88,6 +90,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
             int(song.clip_trigger_quantization),
             int(song.root_note),
             str(song.scale_name),
+            bool(song.scale_mode),
             int(song.count_in_duration),
             float(song.groove_amount),
         )
@@ -124,10 +127,10 @@ class LiveRemoteHandler(AbletonOSCHandler):
         """
         /live/song/start_listen/global_state
 
-        Replies on /live/song/get/global_state with 19 values (see _global_values), right
+        Replies on /live/song/get/global_state with 20 values (see _global_values), right
         away and again after any change, coalesced into one message per tick. Powers the
         top bar: transport, record and automation buttons, tempo, signature, Metronome,
-        Undo and Redo, Global Quantization, scale, count-in and groove amount.
+        Undo and Redo, Global Quantization, Scale Mode and scale, count-in and groove amount.
         """
         self._remove_global_listeners()
         for name in self.GLOBAL_LISTENED:
@@ -159,6 +162,10 @@ class LiveRemoteHandler(AbletonOSCHandler):
     def _set_session_automation_record(self, params):
         """/live/song/set/session_automation_record <0|1>  (Automation Arm)"""
         self.song.session_automation_record = bool(int(params[0]))
+
+    def _set_scale_mode(self, params):
+        """/live/song/set/scale_mode <0|1>  (Scale Mode on or off; the change comes back in global_state)"""
+        self.song.scale_mode = bool(int(params[0]))
 
     def _position(self):
         t = self.song.get_current_beats_song_time()
