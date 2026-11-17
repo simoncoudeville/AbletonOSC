@@ -704,6 +704,16 @@ class LiveRemoteHandler(AbletonOSCHandler):
                 function = lambda: self._queue_scene_data()
                 getattr(scene, "add_%s_listener" % name)(function)
                 self.scene_listeners.append((scene, name, function))
+            # Sent right away, not coalesced: the app tells a click on a Scene Launch button
+            # from a click on a clip by it, since both move the selected scene.
+            function = (lambda scene: lambda: self._scene_triggered(scene))(scene)
+            scene.add_is_triggered_listener(function)
+            self.scene_listeners.append((scene, "is_triggered", function))
+
+    def _scene_triggered(self, scene):
+        scenes = list(self.song.scenes)
+        if scene in scenes:
+            self.osc_server.send("/live/song/get/scene_triggered", (scenes.index(scene),))
 
     def _remove_scene_listeners(self):
         for scene, name, function in self.scene_listeners:
@@ -724,6 +734,10 @@ class LiveRemoteHandler(AbletonOSCHandler):
         Sent as a batch (see _send_batched) with header [scene_count, main_color, first_scene]
         and 5 values per scene: name, color, tempo (-1 when the scene has no tempo of its own),
         time signature numerator and denominator (0 and 0 when it has none).
+
+        Also replies on /live/song/get/scene_triggered <scene_index> each time a scene is
+        launched or its launch takes effect (Scene.is_triggered changes). A click on a clip
+        does not trigger its scene, so this tells the two apart.
         """
         self.scene_data_active = True
         self._update_scenes_listener()
