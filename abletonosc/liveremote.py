@@ -54,6 +54,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.osc_server.add_handler("/live/song/start_listen/scene_data", self._start_listen_scene_data)
         self.osc_server.add_handler("/live/song/stop_listen/scene_data", self._stop_listen_scene_data)
         self.osc_server.add_handler("/live/song/launch_scene", self._launch_scene)
+        self.osc_server.add_handler("/live/song/launch_slot", self._launch_slot)
         self.osc_server.add_handler("/live/song/get/exclusive_arm", lambda params: (bool(self.song.exclusive_arm),))
         self.osc_server.add_handler("/live/song/start_listen/exclusive_arm", self._start_listen_exclusive_arm)
         self.osc_server.add_handler("/live/song/stop_listen/exclusive_arm", self._stop_listen_exclusive_arm)
@@ -747,6 +748,23 @@ class LiveRemoteHandler(AbletonOSCHandler):
         if self.song.select_on_launch:
             self.song.view.selected_scene = scene
         scene.fire(False, False)  # force_legato, can_select_scene_on_launch
+
+    def _launch_slot(self, params):
+        """
+        /live/song/launch_slot <track_index> <scene_index>
+
+        Fires a clip slot as a click on its button in Live does. Launching a clip or a group
+        slot selects its track and scene when Live's "Select on Launch" preference is on.
+        A stop button or an empty slot (recording on an armed track) leaves the selection
+        alone.
+        """
+        track = self.song.tracks[int(params[0])]
+        scene = self.song.scenes[int(params[1])]
+        slot = track.clip_slots[int(params[1])]
+        if self.song.select_on_launch and (slot.has_clip or slot.controls_other_clips):
+            self.song.view.selected_track = track
+            self.song.view.selected_scene = scene
+        slot.fire()
 
     # Exclusive Arm preference -------------------------------------------------------
 
