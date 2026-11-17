@@ -738,13 +738,15 @@ class LiveRemoteHandler(AbletonOSCHandler):
         """
         /live/song/launch_scene <scene_index>
 
-        Selects the scene and fires it as Live's Scene Launch button does, which then
-        selects the next scene. One message instead of view/set/selected_scene followed by
-        scene/fire_as_selected.
+        Launches the scene as a click on its Scene Launch button in Live does: the scene is
+        selected only when Live's "Select on Launch" preference is on, and "Select Next Scene
+        on Launch" does not apply (in Live that is for the Enter key). fire_as_selected is
+        not used: it always moves on to the next scene.
         """
         scene = self.song.scenes[int(params[0])]
-        self.song.view.selected_scene = scene
-        scene.fire_as_selected()
+        if self.song.select_on_launch:
+            self.song.view.selected_scene = scene
+        scene.fire(False, False)  # force_legato, can_select_scene_on_launch
 
     # Exclusive Arm preference -------------------------------------------------------
 
