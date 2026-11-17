@@ -25,6 +25,16 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.global_undo_state = (None, None)
         self.position_active = False
         self.last_position = None
+        self.slot_listeners = []
+        self.slot_grid_active = False
+        self.slot_grid_pending = False
+        self.slot_grid_batch = 0
+        self.scene_listeners = []
+        self.scene_data_active = False
+        self.scene_data_pending = False
+        self.scene_data_batch = 0
+        self.scenes_function = None
+        self.exclusive_arm_active = False
 
     def init_api(self):
         self.osc_server.add_handler("/live/song/get/track_snapshot", lambda params: self._snapshot())
@@ -39,6 +49,14 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.osc_server.add_handler("/live/song/set/scale_mode", self._set_scale_mode)
         self.osc_server.add_handler("/live/song/start_listen/position", self._start_listen_position)
         self.osc_server.add_handler("/live/song/stop_listen/position", self._stop_listen_position)
+        self.osc_server.add_handler("/live/song/start_listen/slot_grid", self._start_listen_slot_grid)
+        self.osc_server.add_handler("/live/song/stop_listen/slot_grid", self._stop_listen_slot_grid)
+        self.osc_server.add_handler("/live/song/start_listen/scene_data", self._start_listen_scene_data)
+        self.osc_server.add_handler("/live/song/stop_listen/scene_data", self._stop_listen_scene_data)
+        self.osc_server.add_handler("/live/song/launch_scene", self._launch_scene)
+        self.osc_server.add_handler("/live/song/get/exclusive_arm", lambda params: (bool(self.song.exclusive_arm),))
+        self.osc_server.add_handler("/live/song/start_listen/exclusive_arm", self._start_listen_exclusive_arm)
+        self.osc_server.add_handler("/live/song/stop_listen/exclusive_arm", self._stop_listen_exclusive_arm)
 
     def _set_arm_exclusive(self, params):
         """
@@ -252,9 +270,10 @@ class LiveRemoteHandler(AbletonOSCHandler):
     def _playback_values(self):
         """
         Per track, in track order: playing_slot_index, fired_slot_index, then for the playing
-        clip its start, end, position (beats) and looping. start is -1 when nothing plays.
-        start/end is the loop range when looping, else the start/end markers. The client
-        animates the position itself from the tempo.
+        clip its start, end, position (beats) and looping, and last whether the playing slot
+        records (7 values). start is -1 when nothing plays. start/end is the loop range when
+        looping, else the start/end markers. The client animates the position itself from
+        the tempo. A group records while any clip inside it records in the playing row.
         """
         values = []
         tracks = list(self.song.tracks)
@@ -269,7 +288,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
                             playing = int(other.playing_slot_index)
                         if fired < 0 and int(other.fired_slot_index) >= 0:
                             fired = int(other.fired_slot_index)
-            start, end, position, looping = -1.0, 0.0, 0.0, False
+            start, end, position, looping, recording = -1.0, 0.0, 0.0, False, False
             if playing >= 0:
                 # A group follows the longest clip playing in its row.
                 candidates = [track] if not track.is_foldable else [
@@ -279,6 +298,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
                     if int(other.playing_slot_index) != playing or not other.clip_slots[playing].has_clip:
                         continue
                     clip = other.clip_slots[playing].clip
+                    if bool(clip.is_recording):
+                        recording = True
                     is_looping = bool(clip.looping)
                     if is_looping:
                         c_start, c_end = float(clip.loop_start), float(clip.loop_end)
@@ -288,7 +309,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
                         best = c_end - c_start
                         start, end, looping = c_start, c_end, is_looping
                         position = float(clip.playing_position)
-            values += [playing, fired, start, end, position, looping]
+            values += [playing, fired, start, end, position, looping, recording]
         return tuple(values)
 
     @staticmethod
@@ -405,6 +426,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
             if self.clip_grid_active:
                 self._rebuild_clip_listeners()
                 self._send_clip_grid()
+            if self.slot_grid_active:
+                self._queue_slot_grid()
 
         self.song.add_tracks_listener(tracks_changed)
         self.listener_functions[key] = tracks_changed
@@ -479,6 +502,269 @@ class LiveRemoteHandler(AbletonOSCHandler):
                 self.logger.info("Group track %s: launchable slots %s" % (
                     track.name, [self._slot_launchable(track, slot) for slot in track.clip_slots]))
         self.osc_server.send("/live/song/get/clip_grid", tuple(values))
+
+    # Batches ------------------------------------------------------------------------
+
+    # macOS caps a UDP datagram at 9216 bytes (net.inet.udp.maxdgram). Larger state goes
+    # out as a batch of messages that each stay under this many bytes.
+    BATCH_LIMIT = 8000
+
+    @staticmethod
+    def _osc_size(value):
+        """Bytes one argument takes in an OSC message, without its type tag."""
+        if isinstance(value, str):
+            return (len(value.encode("utf-8")) // 4 + 1) * 4
+        return 4
+
+    def _send_batched(self, address, batch_id, header, items):
+        """
+        Sends `items` (each a tuple of values) on `address` as one or more messages in the
+        same tick. Each message is [batch_id, part, part_count, *header, first_item, then the
+        values of its items]. The client keeps the parts of the newest batch_id and applies
+        them once all part_count parts have arrived.
+        """
+        fixed = len(address) + 4 + (len(header) + 4) * 5 + 8
+        parts, current, first, size = [], [], 0, fixed
+        for index, item in enumerate(items):
+            item_size = sum(self._osc_size(v) + 1 for v in item)
+            if current and size + item_size > self.BATCH_LIMIT:
+                parts.append((first, current))
+                current, first, size = [], index, fixed
+            current.append(item)
+            size += item_size
+        parts.append((first, current))
+        for part, (first, chunk) in enumerate(parts):
+            values = [batch_id, part, len(parts)] + list(header) + [first]
+            for item in chunk:
+                values += list(item)
+            self.osc_server.send(address, tuple(values))
+
+    # Scene list ---------------------------------------------------------------------
+
+    def _update_scenes_listener(self):
+        """One listener on the scene list serves both slot_grid and scene_data."""
+        wanted = self.slot_grid_active or self.scene_data_active
+        if wanted and self.scenes_function is None:
+            def scenes_changed():
+                if self.slot_grid_active:
+                    self._queue_slot_grid()
+                if self.scene_data_active:
+                    self._queue_scene_data()
+            self.scenes_function = scenes_changed
+            self.song.add_scenes_listener(scenes_changed)
+        elif not wanted and self.scenes_function is not None:
+            try:
+                self.song.remove_scenes_listener(self.scenes_function)
+            except Exception as e:
+                self.logger.info("Exception whilst removing scenes listener (likely benign): %s" % e)
+            self.scenes_function = None
+
+    # Slot grid ----------------------------------------------------------------------
+
+    def _slot_values(self, track, slot):
+        """kind (0 empty, 1 clip, 2 group slot that launches clips), has_stop_button, color, name."""
+        stop = bool(slot.has_stop_button)
+        if slot.has_clip:
+            clip = slot.clip
+            return (1, stop, int(clip.color), str(clip.name))
+        if self._slot_launchable(track, slot):
+            return (2, stop, int(slot.color), "")
+        return (0, stop, -1, "")
+
+    def _send_slot_grid(self):
+        tracks = list(self.song.tracks)
+        items = []
+        for track in tracks:
+            items += [self._slot_values(track, slot) for slot in track.clip_slots]
+        self.slot_grid_batch += 1
+        self._send_batched("/live/song/get/slot_grid", self.slot_grid_batch,
+                           (len(tracks), len(self.song.scenes)), items)
+
+    def _queue_slot_grid(self):
+        """
+        Listeners only queue. On the next tick the slot listeners are rebuilt (a slot may
+        have gained or lost a clip) and one batch with the whole grid goes out.
+        """
+        if self.slot_grid_pending:
+            return
+        self.slot_grid_pending = True
+
+        def flush():
+            self.slot_grid_pending = False
+            if not self.slot_grid_active:
+                return
+            self._rebuild_slot_listeners()
+            self._send_slot_grid()
+
+        self.manager.schedule_message(1, flush)
+
+    def _listen_slot(self, target, name, queue):
+        # Live may refuse one function twice on the same object, so each gets its own.
+        function = lambda: queue()
+        getattr(target, "add_%s_listener" % name)(function)
+        self.slot_listeners.append((target, name, function))
+
+    def _rebuild_slot_listeners(self):
+        self._remove_slot_listeners()
+        for track in self.song.tracks:
+            for slot in track.clip_slots:
+                self._listen_slot(slot, "has_clip", self._queue_slot_grid)
+                self._listen_slot(slot, "has_stop_button", self._queue_slot_grid)
+                if track.is_foldable:
+                    self._listen_slot(slot, "controls_other_clips", self._queue_slot_grid)
+                    self._listen_slot(slot, "color", self._queue_slot_grid)
+                if slot.has_clip:
+                    clip = slot.clip
+                    self._listen_slot(clip, "name", self._queue_slot_grid)
+                    self._listen_slot(clip, "color", self._queue_slot_grid)
+                    # A recording that ends leaves playing_slot_index as it was.
+                    self._listen_slot(clip, "is_recording", self._queue_playback)
+
+    def _remove_slot_listeners(self):
+        for target, name, function in self.slot_listeners:
+            try:
+                getattr(target, "remove_%s_listener" % name)(function)
+            except Exception as e:
+                self.logger.info("Exception whilst removing slot listener (likely benign): %s" % e)
+        self.slot_listeners = []
+
+    def _start_listen_slot_grid(self, params):
+        """
+        /live/song/start_listen/slot_grid
+
+        Replies on /live/song/get/slot_grid with every clip slot of the audio, MIDI and group
+        tracks (return tracks and Main are not in song.tracks), once right away and again
+        after a slot gains or loses a clip or a stop button, a clip is renamed or recolored,
+        or tracks or scenes change. Coalesced into one batch per tick.
+
+        Sent as a batch (see _send_batched) with header [track_count, scene_count,
+        first_slot] and 4 values per slot: kind (0 empty, 1 clip, 2 group slot that launches
+        clips), has_stop_button, color (0xRRGGBB, -1 when empty) and name. Slots go track by
+        track, scene by scene within a track.
+
+        Also listens to Clip.is_recording on every clip, so track_playback goes out when a
+        recording ends.
+        """
+        self.slot_grid_active = True
+        self._update_scenes_listener()
+        self._rebuild_slot_listeners()
+        self._send_slot_grid()
+
+    def _stop_listen_slot_grid(self, params=()):
+        self.slot_grid_active = False
+        self._remove_slot_listeners()
+        self._update_scenes_listener()
+
+    # Scene data ---------------------------------------------------------------------
+
+    SCENE_LISTENED = ("name", "color", "tempo", "tempo_enabled", "time_signature_numerator",
+                      "time_signature_denominator", "time_signature_enabled")
+
+    def _scene_values(self, scene):
+        """name, color, tempo (-1 when the scene has none), numerator and denominator (0, 0 when it has none)."""
+        tempo = float(scene.tempo) if scene.tempo_enabled else -1.0
+        if scene.time_signature_enabled:
+            numerator, denominator = int(scene.time_signature_numerator), int(scene.time_signature_denominator)
+        else:
+            numerator, denominator = 0, 0
+        return (str(scene.name), int(scene.color), tempo, numerator, denominator)
+
+    def _send_scene_data(self):
+        scenes = list(self.song.scenes)
+        self.scene_data_batch += 1
+        self._send_batched("/live/song/get/scene_data", self.scene_data_batch, (len(scenes),),
+                           [self._scene_values(scene) for scene in scenes])
+
+    def _queue_scene_data(self):
+        if self.scene_data_pending:
+            return
+        self.scene_data_pending = True
+
+        def flush():
+            self.scene_data_pending = False
+            if not self.scene_data_active:
+                return
+            self._rebuild_scene_listeners()
+            self._send_scene_data()
+
+        self.manager.schedule_message(1, flush)
+
+    def _rebuild_scene_listeners(self):
+        self._remove_scene_listeners()
+        for scene in self.song.scenes:
+            for name in self.SCENE_LISTENED:
+                # Live refuses one function twice on the same scene ("Observer already
+                # connected"), so each property gets its own.
+                function = lambda: self._queue_scene_data()
+                getattr(scene, "add_%s_listener" % name)(function)
+                self.scene_listeners.append((scene, name, function))
+
+    def _remove_scene_listeners(self):
+        for scene, name, function in self.scene_listeners:
+            try:
+                getattr(scene, "remove_%s_listener" % name)(function)
+            except Exception as e:
+                self.logger.info("Exception whilst removing scene listener (likely benign): %s" % e)
+        self.scene_listeners = []
+
+    def _start_listen_scene_data(self, params):
+        """
+        /live/song/start_listen/scene_data
+
+        Replies on /live/song/get/scene_data with every scene, once right away and again
+        after a scene is renamed, recolored, gets or loses its own tempo or time signature,
+        or scenes are added, deleted or moved. Coalesced into one batch per tick.
+
+        Sent as a batch (see _send_batched) with header [scene_count, first_scene] and 5
+        values per scene: name, color, tempo (-1 when the scene has no tempo of its own),
+        time signature numerator and denominator (0 and 0 when it has none).
+        """
+        self.scene_data_active = True
+        self._update_scenes_listener()
+        self._rebuild_scene_listeners()
+        self._send_scene_data()
+
+    def _stop_listen_scene_data(self, params=()):
+        self.scene_data_active = False
+        self._remove_scene_listeners()
+        self._update_scenes_listener()
+
+    def _launch_scene(self, params):
+        """
+        /live/song/launch_scene <scene_index>
+
+        Selects the scene and fires it as Live's Scene Launch button does, which then
+        selects the next scene. One message instead of view/set/selected_scene followed by
+        scene/fire_as_selected.
+        """
+        scene = self.song.scenes[int(params[0])]
+        self.song.view.selected_scene = scene
+        scene.fire_as_selected()
+
+    # Exclusive Arm preference -------------------------------------------------------
+
+    def _exclusive_arm_changed(self):
+        self.osc_server.send("/live/song/get/exclusive_arm", (bool(self.song.exclusive_arm),))
+
+    def _start_listen_exclusive_arm(self, params):
+        """
+        /live/song/start_listen/exclusive_arm
+
+        Replies on /live/song/get/exclusive_arm [bool] with Live's Exclusive Arm preference,
+        right away and again whenever it is toggled in Live's Preferences.
+        """
+        self._stop_listen_exclusive_arm()
+        self.song.add_exclusive_arm_listener(self._exclusive_arm_changed)
+        self.exclusive_arm_active = True
+        self._exclusive_arm_changed()
+
+    def _stop_listen_exclusive_arm(self, params=()):
+        if self.exclusive_arm_active:
+            try:
+                self.song.remove_exclusive_arm_listener(self._exclusive_arm_changed)
+            except Exception as e:
+                self.logger.info("Exception whilst removing exclusive arm listener (likely benign): %s" % e)
+        self.exclusive_arm_active = False
 
     # Device page --------------------------------------------------------------------
 
@@ -586,6 +872,9 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.osc_server.send("/live/song/get/device_params", tuple(values))
 
     def clear_api(self):
+        self._stop_listen_slot_grid()
+        self._stop_listen_scene_data()
+        self._stop_listen_exclusive_arm()
         self._remove_global_listeners()
         self._stop_listen_position()
         self._remove_clip_listeners()
