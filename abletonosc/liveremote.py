@@ -672,7 +672,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
     def _send_scene_data(self):
         scenes = list(self.song.scenes)
         self.scene_data_batch += 1
-        self._send_batched("/live/song/get/scene_data", self.scene_data_batch, (len(scenes),),
+        self._send_batched("/live/song/get/scene_data", self.scene_data_batch,
+                           (len(scenes), int(self.song.master_track.color)),
                            [self._scene_values(scene) for scene in scenes])
 
     def _queue_scene_data(self):
@@ -691,6 +692,10 @@ class LiveRemoteHandler(AbletonOSCHandler):
 
     def _rebuild_scene_listeners(self):
         self._remove_scene_listeners()
+        # The Main track heads the Scene Launch buttons, in its own color.
+        function = lambda: self._queue_scene_data()
+        self.song.master_track.add_color_listener(function)
+        self.scene_listeners.append((self.song.master_track, "color", function))
         for scene in self.song.scenes:
             for name in self.SCENE_LISTENED:
                 # Live refuses one function twice on the same scene ("Observer already
@@ -713,10 +718,10 @@ class LiveRemoteHandler(AbletonOSCHandler):
 
         Replies on /live/song/get/scene_data with every scene, once right away and again
         after a scene is renamed, recolored, gets or loses its own tempo or time signature,
-        or scenes are added, deleted or moved. Coalesced into one batch per tick.
+        scenes are added, deleted or moved, or the Main track is recolored. Coalesced into one batch per tick.
 
-        Sent as a batch (see _send_batched) with header [scene_count, first_scene] and 5
-        values per scene: name, color, tempo (-1 when the scene has no tempo of its own),
+        Sent as a batch (see _send_batched) with header [scene_count, main_color, first_scene]
+        and 5 values per scene: name, color, tempo (-1 when the scene has no tempo of its own),
         time signature numerator and denominator (0 and 0 when it has none).
         """
         self.scene_data_active = True
