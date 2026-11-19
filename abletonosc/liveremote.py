@@ -7,6 +7,9 @@ class LiveRemoteHandler(AbletonOSCHandler):
     changes merge cleanly.
     """
 
+    # Version of this file's handlers; LiveService.requiredScriptVersion must match.
+    SCRIPT_VERSION = 1
+
     def __init__(self, manager):
         super().__init__(manager)
         self.class_identifier = "song"
@@ -55,6 +58,9 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.osc_server.add_handler("/live/song/stop_listen/scene_data", self._stop_listen_scene_data)
         self.osc_server.add_handler("/live/song/launch_scene", self._launch_scene)
         self.osc_server.add_handler("/live/song/launch_slot", self._launch_slot)
+        # The app asks for this to tell whether Live still runs an older copy of this file,
+        # which only a restart of Live replaces. Bump it with every change the app relies on.
+        self.osc_server.add_handler("/live/song/get/script_version", lambda params: (self.SCRIPT_VERSION,))
         self.osc_server.add_handler("/live/song/get/exclusive_arm", lambda params: (bool(self.song.exclusive_arm),))
         self.osc_server.add_handler("/live/song/start_listen/exclusive_arm", self._start_listen_exclusive_arm)
         self.osc_server.add_handler("/live/song/stop_listen/exclusive_arm", self._stop_listen_exclusive_arm)
