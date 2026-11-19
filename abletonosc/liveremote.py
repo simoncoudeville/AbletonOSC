@@ -8,7 +8,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
     """
 
     # Version of this file's handlers; LiveService.requiredScriptVersion must match.
-    SCRIPT_VERSION = 1
+    SCRIPT_VERSION = 2
 
     def __init__(self, manager):
         super().__init__(manager)
@@ -719,7 +719,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
     def _scene_triggered(self, scene):
         scenes = list(self.song.scenes)
         if scene in scenes:
-            self.osc_server.send("/live/song/get/scene_triggered", (scenes.index(scene),))
+            self.osc_server.send("/live/song/get/scene_triggered", (scenes.index(scene), bool(scene.is_triggered)))
 
     def _remove_scene_listeners(self):
         for scene, name, function in self.scene_listeners:
