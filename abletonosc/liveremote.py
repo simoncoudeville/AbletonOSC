@@ -8,7 +8,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
     """
 
     # Version of this file's handlers; LiveService.requiredScriptVersion must match.
-    SCRIPT_VERSION = 2
+    SCRIPT_VERSION = 3
 
     def __init__(self, manager):
         super().__init__(manager)
@@ -19,6 +19,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.device_page_active = False
         self.playback_listeners = []
         self.playback_pending = False
+        self.snapshot_listeners = []
+        self.snapshot_pending = False
         self.mixer_listeners = []
         self.mixer_pending = False
         self.global_listeners = []
@@ -372,6 +374,44 @@ class LiveRemoteHandler(AbletonOSCHandler):
                 self.logger.info("Exception whilst removing playback listener (likely benign): %s" % e)
         self.playback_listeners = []
 
+    # Track snapshot listeners ---------------------------------------------------------
+
+    def _queue_snapshot(self):
+        """
+        A track's name, color, mute, solo or arm changed. Stock track listeners report the
+        index they were registered under, which is stale for a moment when the list changes
+        (Live renames tracks with default names like "3-MIDI" when one is added, deleted or
+        restored by Undo). These listeners carry no index: they queue one snapshot of all
+        tracks for the next tick.
+        """
+        if self.snapshot_pending:
+            return
+        self.snapshot_pending = True
+
+        def flush():
+            self.snapshot_pending = False
+            self.osc_server.send("/live/song/get/track_snapshot", self._snapshot())
+
+        self.manager.schedule_message(1, flush)
+
+    def _rebuild_snapshot_listeners(self):
+        self._remove_snapshot_listeners()
+        for track in self.song.tracks:
+            names = ["name", "color", "mute", "solo"]
+            if track.can_be_armed:
+                names.append("arm")
+            for name in names:
+                getattr(track, "add_%s_listener" % name)(self._queue_snapshot)
+                self.snapshot_listeners.append((track, name))
+
+    def _remove_snapshot_listeners(self):
+        for track, name in self.snapshot_listeners:
+            try:
+                getattr(track, "remove_%s_listener" % name)(self._queue_snapshot)
+            except Exception as e:
+                self.logger.info("Exception whilst removing snapshot listener (likely benign): %s" % e)
+        self.snapshot_listeners = []
+
     def _snapshot(self):
         """
         /live/song/get/track_snapshot
@@ -408,7 +448,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
         /live/song/start_listen/tracks
 
         Replies on /live/song/get/tracks with the track count, once right away and again
-        whenever a track is added, deleted, duplicated or moved.
+        whenever a track is added, deleted, duplicated or moved. The track snapshot goes out
+        with it, and again whenever a track's name, color, mute, solo or arm changes.
 
         Track listeners are bound to a track object but report the index they were
         registered under. When the list changes those indices are wrong, so all track
@@ -426,6 +467,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
             self.logger.info("Sending track count %d" % len(self.song.tracks))
             self.osc_server.send("/live/song/get/tracks", (len(self.song.tracks),))
             self.osc_server.send("/live/song/get/track_snapshot", self._snapshot())
+            self._rebuild_snapshot_listeners()
             self._rebuild_playback_listeners()
             self.osc_server.send("/live/song/get/track_playback", self._playback_values())
             self._rebuild_mixer_listeners()
@@ -441,6 +483,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.listener_objects[key] = self.song
         self.osc_server.send("/live/song/get/tracks", (len(self.song.tracks),))
         self.osc_server.send("/live/song/get/track_snapshot", self._snapshot())
+        self._rebuild_snapshot_listeners()
         self._rebuild_playback_listeners()
         self.osc_server.send("/live/song/get/track_playback", self._playback_values())
         self._rebuild_mixer_listeners()
@@ -448,6 +491,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
 
     def _stop_listen_tracks(self, params):
         self._stop_listen(self.song, "tracks", ())
+        self._remove_snapshot_listeners()
         self._remove_playback_listeners()
         self._remove_mixer_listeners()
 
@@ -923,6 +967,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self._remove_global_listeners()
         self._stop_listen_position()
         self._remove_clip_listeners()
+        self._remove_snapshot_listeners()
         self._remove_playback_listeners()
         self._remove_mixer_listeners()
         self._remove_device_listeners()
