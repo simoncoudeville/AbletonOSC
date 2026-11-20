@@ -1,3 +1,5 @@
+import time
+
 from .handler import AbletonOSCHandler
 
 
@@ -8,7 +10,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
     """
 
     # Version of this file's handlers; LiveService.requiredScriptVersion must match.
-    SCRIPT_VERSION = 3
+    SCRIPT_VERSION = 4
 
     def __init__(self, manager):
         super().__init__(manager)
@@ -40,6 +42,17 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.scene_data_batch = 0
         self.scenes_function = None
         self.exclusive_arm_active = False
+        self.mix_listeners = []
+        self.mixer_state_active = False
+        self.mixer_state_pending = False
+        self.mixer_state_rebuild = False
+        self.mixer_state_batch = 0
+        self.mix_structure_functions = None
+        self.meter_listeners = []
+        self.meters_active = False
+        self.meters_pending = False
+        self.meters_last_sent = 0.0
+        self.meters_last_values = None
 
     def init_api(self):
         self.osc_server.add_handler("/live/song/get/track_snapshot", lambda params: self._snapshot())
@@ -66,6 +79,19 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.osc_server.add_handler("/live/song/get/exclusive_arm", lambda params: (bool(self.song.exclusive_arm),))
         self.osc_server.add_handler("/live/song/start_listen/exclusive_arm", self._start_listen_exclusive_arm)
         self.osc_server.add_handler("/live/song/stop_listen/exclusive_arm", self._stop_listen_exclusive_arm)
+        self.osc_server.add_handler("/live/song/start_listen/mixer_state", self._start_listen_mixer_state)
+        self.osc_server.add_handler("/live/song/stop_listen/mixer_state", self._stop_listen_mixer_state)
+        self.osc_server.add_handler("/live/song/start_listen/meters", self._start_listen_meters)
+        self.osc_server.add_handler("/live/song/stop_listen/meters", self._stop_listen_meters)
+        self.osc_server.add_handler("/live/strip/set/volume", self._set_strip_volume)
+        self.osc_server.add_handler("/live/strip/set/pan", self._set_strip_pan)
+        self.osc_server.add_handler("/live/strip/set/send", self._set_strip_send)
+        self.osc_server.add_handler("/live/strip/set/active", self._set_strip_active)
+        self.osc_server.add_handler("/live/strip/set/crossfade_assign", self._set_strip_crossfade_assign)
+        self.osc_server.add_handler("/live/strip/solo", self._strip_solo)
+        self.osc_server.add_handler("/live/song/set/crossfader", self._set_crossfader)
+        self.osc_server.add_handler("/live/song/set/cue_volume", self._set_cue_volume)
+        self.osc_server.add_handler("/live/view/select_strip", self._select_strip)
 
     def _set_arm_exclusive(self, params):
         """
@@ -855,6 +881,279 @@ class LiveRemoteHandler(AbletonOSCHandler):
                 self.logger.info("Exception whilst removing exclusive arm listener (likely benign): %s" % e)
         self.exclusive_arm_active = False
 
+    # Mix: every strip (tracks, returns, Main) ----------------------------------------
+
+    STRIP_TRACK, STRIP_RETURN, STRIP_MAIN = 0, 1, 2
+    # Live's crossfade_assign is 0 A, 1 none, 2 B; the app's is 0 off, 1 A, 2 B. The map is
+    # its own inverse.
+    CROSSFADE_SWAP = {0: 1, 1: 0, 2: 2}
+
+    def _strips(self):
+        """(kind, index, track) for every track, then every return, then Main."""
+        strips = [(self.STRIP_TRACK, i, t) for i, t in enumerate(self.song.tracks)]
+        strips += [(self.STRIP_RETURN, i, t) for i, t in enumerate(self.song.return_tracks)]
+        strips.append((self.STRIP_MAIN, 0, self.song.master_track))
+        return strips
+
+    def _strip(self, kind, index):
+        kind, index = int(kind), int(index)
+        if kind == self.STRIP_TRACK:
+            return self.song.tracks[index]
+        if kind == self.STRIP_RETURN:
+            return self.song.return_tracks[index]
+        return self.song.master_track
+
+    @staticmethod
+    def _parameter_values(parameter):
+        return (float(parameter.value), parameter.str_for_value(parameter.value))
+
+    def _strip_values(self, kind, track):
+        """
+        name, color, volume, volume text, pan, pan text, crossfade (0 off, 1 A, 2 B), active,
+        solo, send_count, then value and text per send. Main has no Track Activator, solo
+        or crossfade assign of its own and reports 1, 0 and 0; returns and Main no sends.
+        """
+        mixer = track.mixer_device
+        is_main = kind == self.STRIP_MAIN
+        values = [track.name, int(track.color)]
+        values += self._parameter_values(mixer.volume)
+        values += self._parameter_values(mixer.panning)
+        values.append(0 if is_main else self.CROSSFADE_SWAP.get(int(mixer.crossfade_assign), 0))
+        values.append(1 if is_main else int(not track.mute))
+        values.append(0 if is_main else int(track.solo))
+        sends = list(mixer.sends) if kind == self.STRIP_TRACK else []
+        values.append(len(sends))
+        for send in sends:
+            values += self._parameter_values(send)
+        return tuple(values)
+
+    def _send_mixer_state(self):
+        main = self.song.master_track.mixer_device
+        header = (len(self.song.tracks), len(self.song.return_tracks),
+                  float(main.crossfader.value)) + self._parameter_values(main.cue_volume)
+        items = [self._strip_values(kind, track) for kind, _, track in self._strips()]
+        self.mixer_state_batch += 1
+        self._send_batched("/live/song/get/mixer_state", self.mixer_state_batch, header, items)
+
+    def _queue_mixer_state(self, rebuild=False):
+        if rebuild:
+            self.mixer_state_rebuild = True
+        if self.mixer_state_pending:
+            return
+        self.mixer_state_pending = True
+
+        def flush():
+            self.mixer_state_pending = False
+            if not self.mixer_state_active:
+                return
+            if self.mixer_state_rebuild:
+                self.mixer_state_rebuild = False
+                self._rebuild_mix_listeners()
+                if self.meters_active:
+                    self._rebuild_meter_listeners()
+            self._send_mixer_state()
+
+        self.manager.schedule_message(1, flush)
+
+    @staticmethod
+    def _add_listener(target, name, function, store):
+        if name == "value":
+            target.add_value_listener(function)
+        else:
+            getattr(target, "add_%s_listener" % name)(function)
+        store.append((target, name, function))
+
+    def _remove_listeners(self, store, what):
+        for target, name, function in store:
+            try:
+                if name == "value":
+                    target.remove_value_listener(function)
+                else:
+                    getattr(target, "remove_%s_listener" % name)(function)
+            except Exception as e:
+                self.logger.info("Exception whilst removing %s listener (likely benign): %s" % (what, e))
+        del store[:]
+
+    def _rebuild_mix_listeners(self):
+        self._remove_listeners(self.mix_listeners, "mix")
+        store = self.mix_listeners
+        for kind, _, track in self._strips():
+            # Live may refuse one function twice on the same object, so each gets its own.
+            queue = lambda: self._queue_mixer_state()
+            mixer = track.mixer_device
+            self._add_listener(track, "name", queue, store)
+            self._add_listener(track, "color", queue, store)
+            self._add_listener(mixer.volume, "value", queue, store)
+            self._add_listener(mixer.panning, "value", queue, store)
+            if kind != self.STRIP_MAIN:
+                self._add_listener(track, "mute", queue, store)
+                self._add_listener(track, "solo", queue, store)
+                self._add_listener(mixer, "crossfade_assign", queue, store)
+            if kind == self.STRIP_TRACK:
+                for send in mixer.sends:
+                    self._add_listener(send, "value", lambda: self._queue_mixer_state(), store)
+        main = self.song.master_track.mixer_device
+        self._add_listener(main.crossfader, "value", lambda: self._queue_mixer_state(), store)
+        self._add_listener(main.cue_volume, "value", lambda: self._queue_mixer_state(), store)
+
+    def _update_mix_structure_listeners(self):
+        """Tracks and returns coming and going: rebuild every listener, then resend."""
+        wanted = self.mixer_state_active or self.meters_active
+        if wanted and self.mix_structure_functions is None:
+            functions = (lambda: self._mix_structure_changed(), lambda: self._mix_structure_changed())
+            self.song.add_tracks_listener(functions[0])
+            self.song.add_return_tracks_listener(functions[1])
+            self.mix_structure_functions = functions
+        elif not wanted and self.mix_structure_functions is not None:
+            for name, function in zip(("tracks", "return_tracks"), self.mix_structure_functions):
+                try:
+                    getattr(self.song, "remove_%s_listener" % name)(function)
+                except Exception as e:
+                    self.logger.info("Exception whilst removing mix structure listener (likely benign): %s" % e)
+            self.mix_structure_functions = None
+
+    def _mix_structure_changed(self):
+        if self.mixer_state_active:
+            self._queue_mixer_state(rebuild=True)
+        elif self.meters_active:
+            self.manager.schedule_message(1, self._rebuild_meter_listeners)
+
+    def _start_listen_mixer_state(self, params):
+        """
+        /live/song/start_listen/mixer_state
+
+        Replies on /live/song/get/mixer_state with every strip of Live's mixer, once right
+        away and again after any value changes, coalesced into one batch per tick. Sent as a
+        batch (see _send_batched) with header [track_count, return_count, crossfader,
+        cue_volume, cue_volume_text, first_strip], then per strip, tracks first, then
+        returns, then Main, the values of _strip_values.
+        """
+        self.mixer_state_active = True
+        self._update_mix_structure_listeners()
+        self._rebuild_mix_listeners()
+        self._send_mixer_state()
+
+    def _stop_listen_mixer_state(self, params=()):
+        self.mixer_state_active = False
+        self._remove_listeners(self.mix_listeners, "mix")
+        self._update_mix_structure_listeners()
+
+    # Meters ------------------------------------------------------------------------
+
+    METER_INTERVAL = 0.033
+
+    def _meter_values(self):
+        values = [len(self.song.tracks), len(self.song.return_tracks)]
+        for _, _, track in self._strips():
+            if track.has_audio_output:
+                values += [round(float(track.output_meter_left), 2), round(float(track.output_meter_right), 2)]
+            else:
+                values += [0.0, 0.0]
+        return tuple(values)
+
+    def _send_meters(self):
+        self.meters_pending = False
+        if not self.meters_active:
+            return
+        values = self._meter_values()
+        self.meters_last_sent = time.time()
+        if values != self.meters_last_values:
+            self.meters_last_values = values
+            self.osc_server.send("/live/song/get/meters", values)
+
+    def _meter_changed(self):
+        """
+        Live calls this about 40 times a second per playing track. Send at once when the
+        last message is old enough, else once more on the next tick, so the last level
+        (silence included) always goes out.
+        """
+        if time.time() - self.meters_last_sent >= self.METER_INTERVAL:
+            self._send_meters()
+        elif not self.meters_pending:
+            self.meters_pending = True
+            self.manager.schedule_message(1, self._send_meters)
+
+    def _rebuild_meter_listeners(self):
+        self._remove_listeners(self.meter_listeners, "meter")
+        if not self.meters_active:
+            return
+        for _, _, track in self._strips():
+            if track.has_audio_output:
+                self._add_listener(track, "output_meter_left", lambda: self._meter_changed(), self.meter_listeners)
+                self._add_listener(track, "output_meter_right", lambda: self._meter_changed(), self.meter_listeners)
+
+    def _start_listen_meters(self, params):
+        """
+        /live/song/start_listen/meters
+
+        Sends /live/song/get/meters [track_count, return_count, then left and right of every
+        strip: tracks, returns, Main] whenever a level changes, at most about 30 times a
+        second. The app listens only while Mix is visible.
+        """
+        self.meters_active = True
+        self.meters_last_values = None
+        self._update_mix_structure_listeners()
+        self._rebuild_meter_listeners()
+        self._send_meters()
+
+    def _stop_listen_meters(self, params=()):
+        self.meters_active = False
+        self._remove_listeners(self.meter_listeners, "meter")
+        self._update_mix_structure_listeners()
+
+    # Mix setters -------------------------------------------------------------------
+
+    def _set_strip_volume(self, params):
+        """/live/strip/set/volume <kind> <index> <value>: kind 0 track, 1 return, 2 Main."""
+        self._strip(params[0], params[1]).mixer_device.volume.value = float(params[2])
+
+    def _set_strip_pan(self, params):
+        """/live/strip/set/pan <kind> <index> <value>"""
+        self._strip(params[0], params[1]).mixer_device.panning.value = float(params[2])
+
+    def _set_strip_send(self, params):
+        """/live/strip/set/send <kind> <index> <send> <value>"""
+        self._strip(params[0], params[1]).mixer_device.sends[int(params[2])].value = float(params[3])
+
+    def _set_strip_active(self, params):
+        """/live/strip/set/active <kind> <index> <on>: the Track Activator (on = not muted)."""
+        self._strip(params[0], params[1]).mute = not bool(params[2])
+
+    def _set_strip_crossfade_assign(self, params):
+        """/live/strip/set/crossfade_assign <kind> <index> <0 off, 1 A, 2 B>"""
+        mixer = self._strip(params[0], params[1]).mixer_device
+        mixer.crossfade_assign = self.CROSSFADE_SWAP.get(int(params[2]), 1)
+
+    def _strip_solo(self, params):
+        """
+        /live/strip/solo <kind> <index> <on> <additive>
+
+        Solos or unsolos one track or return. When soloing while Live's Exclusive Solo
+        preference is on and the tap is not additive (no other Solo button held on the
+        iPad), every other track and return is unsoloed in the same call, as a click in
+        Live does. Song.exclusive_solo has no listener, so it is read here, at the tap.
+        """
+        target = self._strip(params[0], params[1])
+        on = bool(params[2])
+        additive = bool(params[3]) if len(params) > 3 else False
+        if on and self.song.exclusive_solo and not additive:
+            for track in list(self.song.tracks) + list(self.song.return_tracks):
+                if track != target and track.solo:
+                    track.solo = False
+        target.solo = on
+
+    def _set_crossfader(self, params):
+        """/live/song/set/crossfader <value from -1 (A) to 1 (B)>"""
+        self.song.master_track.mixer_device.crossfader.value = float(params[0])
+
+    def _set_cue_volume(self, params):
+        """/live/song/set/cue_volume <value>"""
+        self.song.master_track.mixer_device.cue_volume.value = float(params[0])
+
+    def _select_strip(self, params):
+        """/live/view/select_strip <kind> <index>: selects a track, return or Main in Live."""
+        self.song.view.selected_track = self._strip(params[0], params[1])
+
     # Device page --------------------------------------------------------------------
 
     def _start_listen_device_page(self, params):
@@ -877,11 +1176,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
         parameter's position in device_params.
         """
         self.device_page_active = True
+        self._remove_device_page_listener()
         key = ("selected_track_device_page", ())
-        if key in self.listener_functions:
-            self._stop_listen(self.song.view, "selected_track", ())
-            self.listener_functions.pop(key, None)
-            self.listener_objects.pop(key, None)
 
         def selected_track_changed():
             self._rebuild_device_page()
@@ -890,6 +1186,18 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.listener_functions[key] = selected_track_changed
         self.listener_objects[key] = self.song.view
         self._rebuild_device_page()
+
+    def _remove_device_page_listener(self):
+        # Kept under its own key, so the generic cleanup (which calls remove_<key>_listener)
+        # must not see it: removed here instead.
+        key = ("selected_track_device_page", ())
+        function = self.listener_functions.pop(key, None)
+        self.listener_objects.pop(key, None)
+        if function is not None:
+            try:
+                self.song.view.remove_selected_track_listener(function)
+            except Exception as e:
+                self.logger.info("Exception whilst removing device page listener (likely benign): %s" % e)
 
     @staticmethod
     def _is_device_on_parameter(device):
@@ -971,6 +1279,9 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self._remove_playback_listeners()
         self._remove_mixer_listeners()
         self._remove_device_listeners()
+        self._remove_device_page_listener()
+        self._stop_listen_mixer_state()
+        self._stop_listen_meters()
         self.device_page_active = False
         self.clip_grid_active = False
         super().clear_api()
