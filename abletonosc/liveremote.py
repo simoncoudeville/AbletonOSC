@@ -53,6 +53,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.meters_pending = False
         self.meters_last_sent = 0.0
         self.meters_last_values = None
+        self.selected_strip_function = None
 
     def init_api(self):
         self.osc_server.add_handler("/live/song/get/track_snapshot", lambda params: self._snapshot())
@@ -92,6 +93,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.osc_server.add_handler("/live/song/set/crossfader", self._set_crossfader)
         self.osc_server.add_handler("/live/song/set/cue_volume", self._set_cue_volume)
         self.osc_server.add_handler("/live/view/select_strip", self._select_strip)
+        self.osc_server.add_handler("/live/view/start_listen/selected_strip", self._start_listen_selected_strip)
+        self.osc_server.add_handler("/live/view/stop_listen/selected_strip", self._stop_listen_selected_strip)
 
     def _set_arm_exclusive(self, params):
         """
@@ -912,6 +915,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
         name, color, volume, volume text, pan, pan text, crossfade (0 off, 1 A, 2 B), active,
         solo, send_count, then value and text per send. Main has no Track Activator, solo
         or crossfade assign of its own and reports 1, 0 and 0; returns and Main no sends.
+        Main ends with the crossfader (-1 A to 1 B), the cue volume and its text.
         """
         mixer = track.mixer_device
         is_main = kind == self.STRIP_MAIN
@@ -925,12 +929,13 @@ class LiveRemoteHandler(AbletonOSCHandler):
         values.append(len(sends))
         for send in sends:
             values += self._parameter_values(send)
+        if is_main:
+            values.append(float(mixer.crossfader.value))
+            values += self._parameter_values(mixer.cue_volume)
         return tuple(values)
 
     def _send_mixer_state(self):
-        main = self.song.master_track.mixer_device
-        header = (len(self.song.tracks), len(self.song.return_tracks),
-                  float(main.crossfader.value)) + self._parameter_values(main.cue_volume)
+        header = (len(self.song.tracks), len(self.song.return_tracks))
         items = [self._strip_values(kind, track) for kind, _, track in self._strips()]
         self.mixer_state_batch += 1
         self._send_batched("/live/song/get/mixer_state", self.mixer_state_batch, header, items)
@@ -1024,9 +1029,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
 
         Replies on /live/song/get/mixer_state with every strip of Live's mixer, once right
         away and again after any value changes, coalesced into one batch per tick. Sent as a
-        batch (see _send_batched) with header [track_count, return_count, crossfader,
-        cue_volume, cue_volume_text, first_strip], then per strip, tracks first, then
-        returns, then Main, the values of _strip_values.
+        batch (see _send_batched) with header [track_count, return_count, first_strip], then
+        per strip, tracks first, then returns, then Main, the values of _strip_values.
         """
         self.mixer_state_active = True
         self._update_mix_structure_listeners()
@@ -1153,6 +1157,37 @@ class LiveRemoteHandler(AbletonOSCHandler):
     def _select_strip(self, params):
         """/live/view/select_strip <kind> <index>: selects a track, return or Main in Live."""
         self.song.view.selected_track = self._strip(params[0], params[1])
+
+    def _selected_strip(self):
+        selected = self.song.view.selected_track
+        for kind, index, track in self._strips():
+            if track == selected:
+                return (kind, index)
+        return (-1, -1)
+
+    def _send_selected_strip(self):
+        self.osc_server.send("/live/view/get/selected_strip", self._selected_strip())
+
+    def _start_listen_selected_strip(self, params):
+        """
+        /live/view/start_listen/selected_strip
+
+        Replies on /live/view/get/selected_strip [kind, index] (kind 0 track, 1 return,
+        2 Main) right away and whenever the selection changes in Live. Stock
+        /live/view/get/selected_track fails while a return or Main is selected.
+        """
+        self._stop_listen_selected_strip()
+        self.selected_strip_function = lambda: self._send_selected_strip()
+        self.song.view.add_selected_track_listener(self.selected_strip_function)
+        self._send_selected_strip()
+
+    def _stop_listen_selected_strip(self, params=()):
+        if self.selected_strip_function is not None:
+            try:
+                self.song.view.remove_selected_track_listener(self.selected_strip_function)
+            except Exception as e:
+                self.logger.info("Exception whilst removing selected strip listener (likely benign): %s" % e)
+            self.selected_strip_function = None
 
     # Device page --------------------------------------------------------------------
 
@@ -1282,6 +1317,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self._remove_device_page_listener()
         self._stop_listen_mixer_state()
         self._stop_listen_meters()
+        self._stop_listen_selected_strip()
         self.device_page_active = False
         self.clip_grid_active = False
         super().clear_api()
