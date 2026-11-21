@@ -10,9 +10,12 @@ class LiveRemoteHandler(AbletonOSCHandler):
     """
 
     # Version of this file's handlers; LiveService.requiredScriptVersion must match.
-    SCRIPT_VERSION = 4
+    SCRIPT_VERSION = 5
 
     def __init__(self, manager):
+        # Before super().__init__, which calls init_api, which starts the loop passes.
+        self.loop_passes = []
+        self.loop_pass_listeners = []
         super().__init__(manager)
         self.class_identifier = "song"
         self.clip_listeners = []
@@ -95,6 +98,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.osc_server.add_handler("/live/view/select_strip", self._select_strip)
         self.osc_server.add_handler("/live/view/start_listen/selected_strip", self._start_listen_selected_strip)
         self.osc_server.add_handler("/live/view/stop_listen/selected_strip", self._stop_listen_selected_strip)
+        self._start_loop_passes()
 
     def _set_arm_exclusive(self, params):
         """
@@ -308,14 +312,15 @@ class LiveRemoteHandler(AbletonOSCHandler):
     def _playback_values(self):
         """
         Per track, in track order: playing_slot_index, fired_slot_index, then for the playing
-        clip its start, end, position (beats) and looping, and last whether the playing slot
-        records (7 values). start is -1 when nothing plays. start/end is the loop range when
+        clip its start, end, position (beats) and looping, whether the playing slot records,
+        and last its loop pass (8 values; 0 when nothing plays or for a group, see
+        _start_loop_passes). start is -1 when nothing plays. start/end is the loop range when
         looping, else the start/end markers. The client animates the position itself from
         the tempo. A group records while any clip inside it records in the playing row.
         """
         values = []
         tracks = list(self.song.tracks)
-        for track in tracks:
+        for index, track in enumerate(tracks):
             playing = int(track.playing_slot_index)
             fired = int(track.fired_slot_index)
             if track.is_foldable:
@@ -347,7 +352,12 @@ class LiveRemoteHandler(AbletonOSCHandler):
                         best = c_end - c_start
                         start, end, looping = c_start, c_end, is_looping
                         position = float(clip.playing_position)
-            values += [playing, fired, start, end, position, looping, recording]
+            loop_pass = 0
+            if playing >= 0 and not track.is_foldable:
+                entry = self._loop_pass_entry(index, track)
+                if entry is not None and entry["slot"] == playing:
+                    loop_pass = entry["pass"]
+            values += [playing, fired, start, end, position, looping, recording, loop_pass]
         return tuple(values)
 
     @staticmethod
@@ -402,6 +412,113 @@ class LiveRemoteHandler(AbletonOSCHandler):
             except Exception as e:
                 self.logger.info("Exception whilst removing playback listener (likely benign): %s" % e)
         self.playback_listeners = []
+
+    # Loop passes --------------------------------------------------------------------
+
+    def _start_loop_passes(self):
+        """
+        Live does not count how often a playing clip has looped, so this does, per track,
+        from the moment the script loads and whether or not a client listens: a clip
+        launched in Live before the iPad connects still has the right count.
+
+        The pass is 1 when a track's playing slot changes, when the playing clip is launched
+        again (its slot is fired and the fire takes effect) and when the transport starts.
+        On every song time change, a looping clip whose playing_position went down has
+        wrapped: the pass goes up by one and track_playback is queued so the client resyncs.
+        """
+        self.song.add_tracks_listener(self._rebuild_loop_passes)
+        self.song.add_is_playing_listener(self._loop_passes_transport_changed)
+        self.song.add_current_song_time_listener(self._loop_passes_time_changed)
+        self._rebuild_loop_passes()
+
+    def _stop_loop_passes(self):
+        for name, function in (("tracks", self._rebuild_loop_passes),
+                               ("is_playing", self._loop_passes_transport_changed),
+                               ("current_song_time", self._loop_passes_time_changed)):
+            try:
+                getattr(self.song, "remove_%s_listener" % name)(function)
+            except Exception as e:
+                self.logger.info("Exception whilst removing loop pass listener (likely benign): %s" % e)
+        self._remove_loop_pass_listeners()
+        self.loop_passes = []
+
+    def _remove_loop_pass_listeners(self):
+        for target, name, function in self.loop_pass_listeners:
+            try:
+                getattr(target, "remove_%s_listener" % name)(function)
+            except Exception as e:
+                self.logger.info("Exception whilst removing loop pass listener (likely benign): %s" % e)
+        self.loop_pass_listeners = []
+
+    def _rebuild_loop_passes(self):
+        """Tracks changed: one entry per track, keeping the count of the tracks that remain."""
+        self._remove_loop_pass_listeners()
+        old = self.loop_passes
+        entries = []
+        for track in self.song.tracks:
+            entry = next((e for e in old if e["track"] == track), None)
+            if entry is None:
+                entry = {"track": track, "slot": int(track.playing_slot_index), "pass": 1,
+                         "fired": int(track.fired_slot_index), "last": None}
+            entries.append(entry)
+            if track.is_foldable:
+                continue
+            for name, function in (("playing_slot_index", lambda e=entry: self._loop_pass_slot_changed(e)),
+                                   ("fired_slot_index", lambda e=entry: self._loop_pass_fired_changed(e))):
+                getattr(track, "add_%s_listener" % name)(function)
+                self.loop_pass_listeners.append((track, name, function))
+        self.loop_passes = entries
+
+    def _loop_pass_entry(self, index, track):
+        if index < len(self.loop_passes) and self.loop_passes[index]["track"] == track:
+            return self.loop_passes[index]
+        return None
+
+    @staticmethod
+    def _restart_loop_pass(entry):
+        entry["pass"] = 1
+        entry["last"] = None
+
+    def _loop_pass_slot_changed(self, entry):
+        slot = int(entry["track"].playing_slot_index)
+        if slot != entry["slot"]:
+            entry["slot"] = slot
+            self._restart_loop_pass(entry)
+
+    def _loop_pass_fired_changed(self, entry):
+        """A playing clip launched again: its own slot is fired, then the fire takes effect
+        while the playing slot stays the same."""
+        track = entry["track"]
+        fired = int(track.fired_slot_index)
+        if entry["slot"] >= 0 and entry["fired"] == entry["slot"] and fired != entry["fired"] \
+                and int(track.playing_slot_index) == entry["slot"]:
+            self._restart_loop_pass(entry)
+        entry["fired"] = fired
+
+    def _loop_passes_transport_changed(self):
+        if self.song.is_playing:
+            for entry in self.loop_passes:
+                self._restart_loop_pass(entry)
+
+    def _loop_passes_time_changed(self):
+        wrapped = False
+        for entry in self.loop_passes:
+            slot = entry["slot"]
+            track = entry["track"]
+            if slot < 0 or track.is_foldable or slot >= len(track.clip_slots):
+                continue
+            clip_slot = track.clip_slots[slot]
+            if not clip_slot.has_clip or not clip_slot.clip.looping:
+                entry["last"] = None
+                continue
+            position = float(clip_slot.clip.playing_position)
+            last = entry["last"]
+            if last is not None and position < last - 1e-6:
+                entry["pass"] += 1
+                wrapped = True
+            entry["last"] = position
+        if wrapped and self.playback_listeners:
+            self._queue_playback()
 
     # Track snapshot listeners ---------------------------------------------------------
 
@@ -642,14 +759,15 @@ class LiveRemoteHandler(AbletonOSCHandler):
     # Slot grid ----------------------------------------------------------------------
 
     def _slot_values(self, track, slot):
-        """kind (0 empty, 1 clip, 2 group slot that launches clips), has_stop_button, color, name."""
+        """kind (0 empty, 1 clip, 2 group slot that launches clips), has_stop_button, color, name,
+        length (beats: the loop length of a looping clip, else its marker range; -1 without a clip)."""
         stop = bool(slot.has_stop_button)
         if slot.has_clip:
             clip = slot.clip
-            return (1, stop, int(clip.color), str(clip.name))
+            return (1, stop, int(clip.color), str(clip.name), float(clip.length))
         if self._slot_launchable(track, slot):
-            return (2, stop, int(slot.color), "")
-        return (0, stop, -1, "")
+            return (2, stop, int(slot.color), "", -1.0)
+        return (0, stop, -1, "", -1.0)
 
     def _send_slot_grid(self):
         tracks = list(self.song.tracks)
@@ -697,6 +815,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
                     clip = slot.clip
                     self._listen_slot(clip, "name", self._queue_slot_grid)
                     self._listen_slot(clip, "color", self._queue_slot_grid)
+                    for name in ("loop_start", "loop_end", "start_marker", "end_marker", "looping"):
+                        self._listen_slot(clip, name, self._queue_slot_grid)
                     # A recording that ends leaves playing_slot_index as it was.
                     self._listen_slot(clip, "is_recording", self._queue_playback)
 
@@ -718,8 +838,9 @@ class LiveRemoteHandler(AbletonOSCHandler):
         or tracks or scenes change. Coalesced into one batch per tick.
 
         Sent as a batch (see _send_batched) with header [track_count, scene_count,
-        first_slot] and 4 values per slot: kind (0 empty, 1 clip, 2 group slot that launches
-        clips), has_stop_button, color (0xRRGGBB, -1 when empty) and name. Slots go track by
+        first_slot] and 5 values per slot: kind (0 empty, 1 clip, 2 group slot that launches
+        clips), has_stop_button, color (0xRRGGBB, -1 when empty), name and length in beats
+        (-1 without a clip; follows loop and marker edits). Slots go track by
         track, scene by scene within a track.
 
         Also listens to Clip.is_recording on every clip, so track_playback goes out when a
@@ -1304,6 +1425,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.osc_server.send("/live/song/get/device_params", tuple(values))
 
     def clear_api(self):
+        self._stop_loop_passes()
         self._stop_listen_slot_grid()
         self._stop_listen_scene_data()
         self._stop_listen_exclusive_arm()
