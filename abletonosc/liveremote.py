@@ -106,6 +106,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.osc_server.add_handler("/live/song/start_listen/perform", self._start_listen_perform)
         self.osc_server.add_handler("/live/song/stop_listen/perform", self._stop_listen_perform)
         self.osc_server.add_handler("/live/strip/set/parameter", self._set_strip_parameter)
+        self.osc_server.add_handler("/live/spike/song_data", self._spike_song_data)
         self._start_loop_passes()
 
     def _set_arm_exclusive(self, params):
@@ -1572,6 +1573,40 @@ class LiveRemoteHandler(AbletonOSCHandler):
         _, parameter = self._perform_parameter((int(params[0]), int(params[1]), int(params[2]), int(params[3])))
         if parameter is not None:
             parameter.value = min(max(float(params[4]), parameter.min), parameter.max)
+
+    def _spike_song_data(self, params):
+        """
+        SPIKE, remove after: /live/spike/song_data [mode]. mode "write" stores test values in the
+        Live Set, anything else only reads them. Results go to the log.
+        """
+        import json
+        log = lambda text: self.logger.info("SPIKE song_data: %s" % text)
+        song = self.song
+        log("has get_data=%s set_data=%s" % (hasattr(song, "get_data"), hasattr(song, "set_data")))
+        for name in ("get_data", "set_data"):
+            try:
+                log("%s doc: %s" % (name, getattr(type(song), name).__doc__))
+            except Exception as e:
+                log("%s doc error: %s" % (name, e))
+        mode = str(params[0]) if params else "read"
+        big = json.dumps({"controls": [{"id": i, "name": "x" * 40} for i in range(200)]})
+        if mode == "write":
+            log("can_undo before=%s" % song.can_undo)
+            for key, value in (("liveremote.small", "hello"), ("liveremote.big", big), ("liveremote.int", 42)):
+                try:
+                    song.set_data(key, value)
+                    log("set %s ok (%s, %d chars)" % (key, type(value).__name__, len(str(value))))
+                except Exception as e:
+                    log("set %s failed: %r" % (key, e))
+            log("can_undo after=%s" % song.can_undo)
+        for key in ("liveremote.small", "liveremote.big", "liveremote.int", "liveremote.missing"):
+            try:
+                value = song.get_data(key, None)
+                log("get %s -> %s, %d chars, equal to written=%s" % (
+                    key, type(value).__name__, len(str(value)),
+                    value == {"liveremote.small": "hello", "liveremote.big": big, "liveremote.int": 42}.get(key)))
+            except Exception as e:
+                log("get %s failed: %r" % (key, e))
 
     def clear_api(self):
         self._stop_loop_passes()
