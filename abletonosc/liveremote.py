@@ -10,7 +10,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
     """
 
     # Version of this file's handlers; LiveService.requiredScriptVersion must match.
-    SCRIPT_VERSION = 5
+    SCRIPT_VERSION = 6
 
     def __init__(self, manager):
         # Before super().__init__, which calls init_api, which starts the loop passes.
@@ -57,6 +57,9 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.meters_last_sent = 0.0
         self.meters_last_values = None
         self.selected_strip_function = None
+        self.selected_parameter_function = None
+        self.perform_refs = []
+        self.perform_listeners = []
 
     def init_api(self):
         self.osc_server.add_handler("/live/song/get/track_snapshot", lambda params: self._snapshot())
@@ -98,6 +101,11 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.osc_server.add_handler("/live/view/select_strip", self._select_strip)
         self.osc_server.add_handler("/live/view/start_listen/selected_strip", self._start_listen_selected_strip)
         self.osc_server.add_handler("/live/view/stop_listen/selected_strip", self._stop_listen_selected_strip)
+        self.osc_server.add_handler("/live/view/start_listen/selected_parameter", self._start_listen_selected_parameter)
+        self.osc_server.add_handler("/live/view/stop_listen/selected_parameter", self._stop_listen_selected_parameter)
+        self.osc_server.add_handler("/live/song/start_listen/perform", self._start_listen_perform)
+        self.osc_server.add_handler("/live/song/stop_listen/perform", self._stop_listen_perform)
+        self.osc_server.add_handler("/live/strip/set/parameter", self._set_strip_parameter)
         self._start_loop_passes()
 
     def _set_arm_exclusive(self, params):
@@ -1424,6 +1432,147 @@ class LiveRemoteHandler(AbletonOSCHandler):
                        bool(parameter.is_quantized), parameter.str_for_value(parameter.value)]
         self.osc_server.send("/live/song/get/device_params", tuple(values))
 
+    # Perform view (prototype) ----------------------------------------------------------
+
+    def _locate_parameter(self, parameter):
+        """
+        (kind, index, device, param, reason) for a parameter of a device that sits directly on
+        a track, return or Main. reason is "" when found, else "mixer" (volume, pan, sends),
+        "rack" (a device inside a rack chain) or "unknown"; the indices are -1 then.
+        """
+        device = parameter.canonical_parent
+        holder = getattr(device, "canonical_parent", None)
+        for kind, index, track in self._strips():
+            if holder == track:
+                if device == track.mixer_device:
+                    return (-1, -1, -1, -1, "mixer")
+                devices = list(track.devices)
+                if device in devices:
+                    return (kind, index, devices.index(device), list(device.parameters).index(parameter), "")
+        is_chain = holder is not None and type(holder).__name__ in ("Chain", "DrumChain")
+        return (-1, -1, -1, -1, "rack" if is_chain else "unknown")
+
+    def _send_selected_parameter(self):
+        parameter = self.song.view.selected_parameter
+        if parameter is None:
+            return
+        try:
+            kind, index, device, position, reason = self._locate_parameter(parameter)
+            device_name = getattr(parameter.canonical_parent, "name", "")
+        except Exception as e:
+            self.logger.info("Could not locate selected parameter: %s" % e)
+            kind, index, device, position, reason, device_name = -1, -1, -1, -1, "unknown", ""
+        self.osc_server.send("/live/view/get/selected_parameter",
+                             (kind, index, device, position, parameter.name, device_name, reason))
+
+    def _start_listen_selected_parameter(self, params):
+        """
+        /live/view/start_listen/selected_parameter
+
+        Whenever the parameter selected in Live changes (clicking a knob or slider in a device),
+        replies on /live/view/get/selected_parameter [kind, index, device, param, name,
+        device name, reason]. kind and index address the strip as in /live/strip/*, device is
+        the index in that strip's devices, param the index in the device's parameters. When
+        the parameter cannot be addressed that way, the four are -1 and reason says why
+        ("mixer", "rack" or "unknown"). Nothing is sent right away: the Perform view maps the
+        next parameter the user clicks.
+        """
+        self._stop_listen_selected_parameter()
+        self.selected_parameter_function = lambda: self._send_selected_parameter()
+        self.song.view.add_selected_parameter_listener(self.selected_parameter_function)
+
+    def _stop_listen_selected_parameter(self, params=()):
+        if self.selected_parameter_function is not None:
+            try:
+                self.song.view.remove_selected_parameter_listener(self.selected_parameter_function)
+            except Exception as e:
+                self.logger.info("Exception whilst removing selected parameter listener (likely benign): %s" % e)
+            self.selected_parameter_function = None
+
+    def _perform_parameter(self, ref):
+        kind, index, device, position = ref
+        try:
+            strips = {(k, i): t for k, i, t in self._strips()}
+            track = strips.get((kind, index))
+            if track is None:
+                return None, None
+            devices = list(track.devices)
+            if not 0 <= device < len(devices):
+                return None, None
+            parameters = list(devices[device].parameters)
+            if not 0 <= position < len(parameters):
+                return None, None
+            return devices[device], parameters[position]
+        except Exception:
+            return None, None
+
+    def _start_listen_perform(self, params):
+        """
+        /live/song/start_listen/perform [kind, index, device, param] x n
+
+        Watches the listed parameters (the Perform view's mapped controls) and replies with
+        /live/song/get/perform [count, (found, name, device name, value, min, max,
+        is_quantized, value_string) x count] right away and whenever a device list or the
+        track list changes, and with /live/song/get/perform_value [slot, value, value_string]
+        when one value changes. slot is the position in the list sent here. Indices are
+        resolved again on every rebuild, so a moved device shows up as a different (or no)
+        parameter: the app compares names.
+        """
+        values = [int(v) for v in params]
+        self.perform_refs = [tuple(values[i:i + 4]) for i in range(0, len(values) - len(values) % 4, 4)]
+        self._rebuild_perform()
+
+    def _stop_listen_perform(self, params=()):
+        self._remove_perform_listeners()
+        self.perform_refs = []
+
+    def _remove_perform_listeners(self):
+        for remove_listener, function in self.perform_listeners:
+            try:
+                remove_listener(function)
+            except Exception as e:
+                self.logger.info("Exception whilst removing perform listener (likely benign): %s" % e)
+        self.perform_listeners = []
+
+    def _perform_watch(self, add_listener, remove_listener, function):
+        add_listener(function)
+        self.perform_listeners.append((remove_listener, function))
+
+    def _rebuild_perform(self):
+        self._remove_perform_listeners()
+        if not self.perform_refs:
+            return
+        rebuild = lambda: self.manager.schedule_message(1, self._rebuild_perform)
+        self._perform_watch(self.song.add_tracks_listener, self.song.remove_tracks_listener, rebuild)
+        self._perform_watch(self.song.add_return_tracks_listener, self.song.remove_return_tracks_listener, rebuild)
+        watched = set()
+        strips = {(k, i): t for k, i, t in self._strips()}
+        values = [len(self.perform_refs)]
+        for slot, ref in enumerate(self.perform_refs):
+            track = strips.get((ref[0], ref[1]))
+            if track is not None and (ref[0], ref[1]) not in watched:
+                watched.add((ref[0], ref[1]))
+                self._perform_watch(track.add_devices_listener, track.remove_devices_listener, rebuild)
+            device, parameter = self._perform_parameter(ref)
+            if parameter is None:
+                values += [False, "", "", 0.0, 0.0, 1.0, False, ""]
+                continue
+
+            def value_changed(parameter=parameter, slot=slot):
+                self.osc_server.send("/live/song/get/perform_value",
+                                     (slot, float(parameter.value), parameter.str_for_value(parameter.value)))
+            self._perform_watch(parameter.add_value_listener, parameter.remove_value_listener, value_changed)
+            values += [True, parameter.name, device.name, float(parameter.value), float(parameter.min),
+                       float(parameter.max), bool(parameter.is_quantized),
+                       parameter.str_for_value(parameter.value)]
+        self.osc_server.send("/live/song/get/perform", tuple(values))
+
+    def _set_strip_parameter(self, params):
+        """/live/strip/set/parameter <kind> <index> <device> <param> <value>: any device on a track, return or Main."""
+        _, parameter = self._perform_parameter((int(params[0]), int(params[1]), int(params[2]), int(params[3])))
+        if parameter is not None:
+            parameter.value = min(max(float(params[4]), parameter.min), parameter.max)
+
     def clear_api(self):
         self._stop_loop_passes()
         self._stop_listen_slot_grid()
@@ -1440,6 +1589,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self._stop_listen_mixer_state()
         self._stop_listen_meters()
         self._stop_listen_selected_strip()
+        self._stop_listen_selected_parameter()
+        self._stop_listen_perform()
         self.device_page_active = False
         self.clip_grid_active = False
         super().clear_api()
