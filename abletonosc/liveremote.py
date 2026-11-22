@@ -10,7 +10,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
     """
 
     # Version of this file's handlers; LiveService.requiredScriptVersion must match.
-    SCRIPT_VERSION = 6
+    SCRIPT_VERSION = 7
 
     def __init__(self, manager):
         # Before super().__init__, which calls init_api, which starts the loop passes.
@@ -60,6 +60,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.selected_parameter_function = None
         self.perform_refs = []
         self.perform_listeners = []
+        self.perform_layout_batch = 0
+        self.perform_layout_upload = (None, {})
 
     def init_api(self):
         self.osc_server.add_handler("/live/song/get/track_snapshot", lambda params: self._snapshot())
@@ -106,6 +108,8 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.osc_server.add_handler("/live/song/start_listen/perform", self._start_listen_perform)
         self.osc_server.add_handler("/live/song/stop_listen/perform", self._stop_listen_perform)
         self.osc_server.add_handler("/live/strip/set/parameter", self._set_strip_parameter)
+        self.osc_server.add_handler("/live/song/get/perform_layout", self._get_perform_layout)
+        self.osc_server.add_handler("/live/song/set/perform_layout", self._set_perform_layout)
         self._start_loop_passes()
 
     def _set_arm_exclusive(self, params):
@@ -1566,6 +1570,61 @@ class LiveRemoteHandler(AbletonOSCHandler):
                        float(parameter.max), bool(parameter.is_quantized),
                        parameter.str_for_value(parameter.value)]
         self.osc_server.send("/live/song/get/perform", tuple(values))
+
+    # The Perform layout is stored in the Live Set, so every project keeps its own.
+    PERFORM_LAYOUT_KEY = "liveremote.perform_layout"
+    PERFORM_LAYOUT_CHUNK = 6000
+
+    @staticmethod
+    def _utf8_chunks(text, limit):
+        """Splits text into pieces of at most `limit` UTF-8 bytes, never inside a character."""
+        chunks, current, size = [], [], 0
+        for character in text:
+            length = len(character.encode("utf-8"))
+            if current and size + length > limit:
+                chunks.append("".join(current))
+                current, size = [], 0
+            current.append(character)
+            size += length
+        chunks.append("".join(current))
+        return chunks
+
+    def _get_perform_layout(self, params):
+        """
+        /live/song/get/perform_layout
+
+        Replies with the layout stored in the Set (a JSON string, empty when the Set has
+        none) as a batch: /live/song/get/perform_layout [batch_id, part, part_count, first,
+        chunk]. Joining the chunks in part order gives the string. Nothing is returned
+        directly, so the batch is the only reply.
+        """
+        try:
+            text = self.song.get_data(self.PERFORM_LAYOUT_KEY, "") or ""
+        except Exception as e:
+            self.logger.info("Could not read the Perform layout: %s" % e)
+            text = ""
+        self.perform_layout_batch += 1
+        chunks = self._utf8_chunks(str(text), self.PERFORM_LAYOUT_CHUNK)
+        for part, chunk in enumerate(chunks):
+            self.osc_server.send("/live/song/get/perform_layout",
+                                 (self.perform_layout_batch, part, len(chunks), part, chunk))
+
+    def _set_perform_layout(self, params):
+        """
+        /live/song/set/perform_layout <transfer_id> <part> <part_count> <chunk>
+
+        Stores a layout in the Set once every part of a transfer has arrived. A part with
+        another transfer id drops the unfinished one.
+        """
+        transfer, part, count, chunk = int(params[0]), int(params[1]), int(params[2]), str(params[3])
+        current, parts = self.perform_layout_upload
+        if transfer != current:
+            parts = {}
+        parts[part] = chunk
+        self.perform_layout_upload = (transfer, parts)
+        if len(parts) == count and all(i in parts for i in range(count)):
+            self.song.set_data(self.PERFORM_LAYOUT_KEY, "".join(parts[i] for i in range(count)))
+            self.perform_layout_upload = (None, {})
 
     def _set_strip_parameter(self, params):
         """/live/strip/set/parameter <kind> <index> <device> <param> <value>: any device on a track, return or Main."""
