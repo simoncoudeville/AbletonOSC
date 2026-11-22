@@ -10,7 +10,7 @@ class LiveRemoteHandler(AbletonOSCHandler):
     """
 
     # Version of this file's handlers; LiveService.requiredScriptVersion must match.
-    SCRIPT_VERSION = 7
+    SCRIPT_VERSION = 8
 
     def __init__(self, manager):
         # Before super().__init__, which calls init_api, which starts the loop passes.
@@ -62,6 +62,11 @@ class LiveRemoteHandler(AbletonOSCHandler):
         self.perform_listeners = []
         self.perform_layout_batch = 0
         self.perform_layout_upload = (None, {})
+        # Tell a connected app that this copy of the handlers just started (Live opened a
+        # Set, or the code was reloaded): every listener it registered is gone, so it must
+        # sync again. LiveBridge swallows /live/test, hence an address of our own.
+        self.manager.schedule_message(1, lambda: self.osc_server.send("/live/liveremote/started",
+                                                                     (self.SCRIPT_VERSION,)))
 
     def init_api(self):
         self.osc_server.add_handler("/live/song/get/track_snapshot", lambda params: self._snapshot())
